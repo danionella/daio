@@ -38,8 +38,7 @@ jobs:
       - name: Run pdoc
         run: |
           conda activate docs
-          cd src
-          pdoc --docformat google daio -o ../docs
+          pdoc --docformat google src/daio -o docs
       - uses: actions/upload-pages-artifact@v3
         with:
           path: docs/

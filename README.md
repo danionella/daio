@@ -8,29 +8,15 @@
 # daio
 Video and data IO tools for Python.
 
-[only applies if you decide to make the documentation public:]
 Links: [API documentation](http://danionella.github.io/my_package), [GitHub repository](https://github.com/danionella/my_package)
 
 ## Installation
-### Hardware requirements
-- a Linux or Windows PC
-
-### Software prerequisites
-- If any
-
-### Install daio
-- For development, clone this repository change to the directory containing `pyproject.toml` 
-- `conda env create -n my_package -f environment.yml`
-- `conda activate my_package`
-- `pip install -e .`
-
-[only applies to pulic repositories:]
-- or, via conda: `conda install danionella::my_package `
-- or, if you prefer pip: `pip install my_package`
+- via conda or mamba: `conda install danionella::daio `
+- if you prefer pip: `pip install daio`
+- for development, clone this repository change to the directory containing `pyproject.toml` 
+    - `conda env create -n env_name -f environment.yml`
+    - `conda activate env_name`
+    - `pip install -e .`
 
 ## Use 
-Description of usage, with examples.
-
-## See also
-- related repo  or project 1
-- related repo  or project 1
+TODO.

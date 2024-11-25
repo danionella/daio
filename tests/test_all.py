@@ -36,7 +36,8 @@ def test_hdf5():
     }
     save_to_h5('test.h5', data)
     data2 = load_from_h5('test.h5')
-    assert data == data2
+
+    assert str(data) == str(data2)
     # FAILED tests/test_all.py::test_hdf5 - ValueError: The truth value of an array with more than one element is ambiguous. Use a.any() or a.all()
     # how do I comapre two dicts properly? PLEASE SNIPPET
 

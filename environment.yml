@@ -6,4 +6,5 @@ dependencies:
   - python>=3.8
   - pip
   - numpy
+  - av
   - tqdm

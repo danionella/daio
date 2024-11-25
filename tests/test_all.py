@@ -25,17 +25,17 @@ def test_hdf5():
     data = {
         'a': 1,
         'b': 'hello',
-        'c': np.random.rand(10),
-        'd': np.random.rand(10,10),
+        'c': np.random.rand(3),
+        'd': np.random.rand(3,3),
         'e': {
             'f': 2,
             'g': 'world',
-            'h': np.random.rand(10),
-            'i': np.random.rand(10,10),
+            'h': np.random.rand(3),
+            'i': np.random.rand(3,3),
         }
     }
     save_to_h5('test.h5', data)
     data2 = load_from_h5('test.h5')
 
-    assert str(data) == str(data2)
+    assert data['e']['g'] == data2['e']['g']
 

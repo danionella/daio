@@ -3,26 +3,26 @@ requires = ["setuptools>=42", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "my_package"
+name = "daio"
 version = "0.0.1"
-description = "my_package for Python"
+description = "video and data IO tools for Python"
 authors = [
     { name = "jlab.berlin" },
 ]
 license = {text = "MIT"}
 readme = "README.md"
-keywords = ["my_package", "python"]
+keywords = ["python", "HDF5", "data IO", "video IO"]
 requires-python = ">=3.8"
 dependencies = [
     "numpy","scipy","tqdm"
 ]
 
 [project.urls]
-Homepage = "https://github.com/danionella/my_package"
+Homepage = "https://github.com/danionella/daio"
 
 [tool.setuptools.packages.find]
 where = ["src"]
-include = ["my_package*"]
+include = ["daio*"]
 
 [tool.pytest.ini_options]
 addopts = [

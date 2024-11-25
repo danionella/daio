@@ -7,4 +7,6 @@ dependencies:
   - pip
   - numpy
   - av
+  - h5py
+  - hdf5plugin
   - tqdm

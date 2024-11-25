@@ -8,7 +8,7 @@
 # daio
 Video and data IO tools for Python.
 
-Links: [API documentation](http://danionella.github.io/my_package), [GitHub repository](https://github.com/danionella/my_package)
+Links: [API documentation](http://danionella.github.io/daio), [GitHub repository](https://github.com/danionella/daio)
 
 ## Installation
 - via conda or mamba: `conda install danionella::daio `
@@ -19,4 +19,58 @@ Links: [API documentation](http://danionella.github.io/my_package), [GitHub repo
     - `pip install -e .`
 
 ## Use 
-TODO.
+
+### Video IO
+
+Write video:
+```python
+from daio.video import VideoReader, VideoWriter
+writer = VideoWriter('/path/to/video.mp4', fps=25)
+for i in range(20):
+    frame = np.random.randint(0,255,size=(720,1280), dtype='uint8')
+    writer.write(frame)
+writer.close()
+```
+
+Read video:
+```python
+reader = VideoReader('/path/to/video.mp4')
+frame_7 = reader[7]
+first10_frames = reader[:10]
+for frame in reader:
+    process_frame(frame)
+reader.close()
+```
+
+You can also use with statements to handle file closure:
+```python
+with VideoWriter('/path/to/video.mp4', fps=25) as writer:
+    for i in range(20):
+        frame = np.random.randint(0,255,size=(720,1280), dtype='uint8')
+        writer.write(frame)
+#or
+with VideoReader('/path/to/video.mp4') as reader:
+    frame_7 = reader[7]
+```
+
+### HDF5 file IO
+
+Write a Python dict to a HDF5 file:
+```python
+from daio.h5 import save_to_h5, load_from_h5, lazyh5
+some_dict = dict(a = 1, b = np.random.randn(3,4,5), c = dict(g='nested'), d = 'some_string')
+save_to_h5('/path/to/datafile.h5', some_dict)
+```
+
+Load HDF5 contents to dict:
+```python
+dict_loaded = load_from_h5('/path/to/datafile.h5', d)
+```
+
+Lazily load HDF5 with a dict-like interface (contents are only loaded when accessed):
+```python
+h5 = lazyh5('/path/to/datafile.h5')
+b_loaded = h5['b']
+g_loaded = h5['c']['g']
+h5.keys()
+```

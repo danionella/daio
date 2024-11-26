@@ -131,6 +131,8 @@ class lazyh5:
             if isinstance(item, h5py.Group):
                 return lazyh5(self._filepath, h5path=f"{self._h5path}/{key}")
             elif isinstance(item, h5py.Dataset):
+                if h5py.check_string_dtype(item.dtype) is not None:
+                    item = item.asstr()
                 return item[()]
             else:
                 raise KeyError(f"Unknown item type for key: {key}")

@@ -172,3 +172,44 @@ class lazyh5:
     def __dir__(self):
         """Lists all accessible attributes and keys."""
         return self.keys() + dir(super())
+    
+    def inspect_structure(self, group=None, prefix=""):
+        """Returns a dictionary with the hierarchical structure of the HDF5 file.
+
+        Args:
+            group (h5py.Group, optional): The HDF5 group to start from. Defaults to the root group.
+            prefix (str, optional): The prefix for the keys representing the hierarchy. Defaults to "".
+
+        Returns:
+            dict: A dictionary where keys are paths to datasets or groups, and values are shape/dtype for datasets.
+        """
+        with h5py.File(self._filepath, 'r') as f:
+            # Default to the group at the current h5path
+            group = f[self._h5path] if group is None else group
+
+            def _recursive_structure(g):
+                structure = {}
+                for key in g:
+                    item = g[key]
+                    if isinstance(item, h5py.Group):
+                        structure[key] = _recursive_structure(item)
+                    elif isinstance(item, h5py.Dataset):
+                        if h5py.check_string_dtype(item.dtype) is not None:
+                            if item.dtype.itemsize <= 50:
+                                info = item.asstr()[()]
+                            else:
+                                info = f"<len {item.dtype.itemsize} str>"
+                        else:
+                            if item.size == 1:
+                                info = item[()]
+                            else:
+                                info = f"<{item.shape} {item.dtype}>"
+                        structure[key] = info
+                return structure
+
+            return _recursive_structure(group)
+        
+    def _ipython_display_(self):
+        """Displays a summary of the object in IPython."""
+        from IPython.display import JSON
+        display(JSON(self.inspect_structure(), root='/'))

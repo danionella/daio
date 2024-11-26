@@ -1,4 +1,4 @@
-import json 
+import json, os
 #TODO: test replacing json with orjson
 import warnings
 from os.path import expanduser
@@ -59,10 +59,10 @@ def save_to_h5(filename, data, serialize=True, compression=None, json_compressio
 
     filename = expanduser(filename)
     with h5py.File(filename, file_mode) as h5file:
-        recursively_save_contents_to_group(h5file, '/', data)
+        recursively_save_contents_to_group(h5file, h5path, data)
 
 
-def load_from_h5(filename):
+def load_from_h5(filename, h5path='/'):
     ''' Load an HDF5 file to a dictionary
     
     Args:
@@ -126,13 +126,52 @@ class lazyh5:
         with h5py.File(self._filepath, 'r') as f:
             out = list(f[self._h5path].keys())
         return out
+    
+    def to_dict(self):
+        """Reads the HDF5 file or group into a dictionary.
+
+        Returns:
+            dict: A dictionary representation of the HDF5 file.
+        """
+        return load_from_h5(self._filepath, h5path=self._h5path)
+    
+    def from_dict(self, data):
+        """Writes a dictionary to the HDF5 file or group.
+
+        Args:
+            data (dict): A dictionary to write to the HDF5 file (if readonly is False).
+        """
+        if self._readonly:
+            raise ValueError("Cannot add data to a read-only lazyh5 object.")
+        if os.path.exists(self._filepath):
+            with h5py.File(self._filepath, 'r') as f:
+                for k, v in data.items():
+                    if (self._h5path+'/'+k in f):
+                        raise AttributeError(f"Dataset or group '{k}' already exists!")
+        save_to_h5(self._filepath, data, h5path=self._h5path, file_mode='a')
+
+    def remove_key(self, key):
+        """Removes the HDF5 dataset or group. Note this does not free up space in the file.
+        
+        Args:
+            key (str): The key to remove.
+        """
+        if self._readonly:
+            raise ValueError("Cannot remove data from a read-only lazyh5 object.")
+        else:
+            if os.path.exists(self._filepath):
+                with h5py.File(self._filepath, 'a') as f:
+                    if key in f[self._h5path]:
+                        del f[self._h5path][key]
+                    else:
+                        raise KeyError(f"Key '{key}' not found in HDF5 file.")
 
     def __getitem__(self, key):
         """Gets an item by key."""
         with h5py.File(self._filepath, 'r') as f:
             item = f[self._h5path][key]
             if isinstance(item, h5py.Group):
-                return lazyh5(self._filepath, h5path=f"{self._h5path}/{key}")
+                return lazyh5(self._filepath, h5path=f"{self._h5path}/{key}".lstrip('/'))
             elif isinstance(item, h5py.Dataset):
                 if h5py.check_string_dtype(item.dtype) is not None:
                     item = item.asstr()
@@ -152,13 +191,8 @@ class lazyh5:
         if key.startswith('_'):
             super().__setattr__(key, value)
             return
-
-        with h5py.File(self._filepath, 'a') as f:
-            full_path = f"{self._h5path}/{key}".lstrip('/')
-            if (full_path in f) and (not self._overwrite):
-                raise AttributeError(f"Dataset or group '{key}' already exists.")
-            else:
-                f[self._h5path].create_dataset(key, data=value)
+        
+        self.from_dict({key: value})
 
     def __len__(self):
         """Gets the number of items in the current HDF5 group."""

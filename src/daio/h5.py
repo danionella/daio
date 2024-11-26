@@ -109,13 +109,13 @@ class lazyh5:
     Args:
             filepath (str): Path to the HDF5 file.
             h5path (str, optional): HDF5 group path. Defaults to '/'.
-            overwrite (bool, optional): Whether to overwrite existing items. Defaults to False.
+            readonly (str, optional): Whether to open the file in read-only mode. Defaults to False.
     """
 
-    def __init__(self, filepath, h5path='/', overwrite=False):
+    def __init__(self, filepath, h5path='/', readonly=True):
         self._filepath = filepath
         self._h5path = h5path
-        self._overwrite = overwrite
+        self._readonly = readonly
 
     def keys(self):
         """Lists the keys of the current HDF5 group.

@@ -9,7 +9,7 @@ import h5py
 #TODO: test defaulting to hdf5plugin.Zstd compression for json-serialized strings
 
 
-def save_to_h5(filename, data, serialize=True, compression=None, json_compression='gzip', verbosity=1, file_mode='w', convert_numpy_to_native=False):
+def save_to_h5(filename, data, serialize=True, compression=None, json_compression='gzip', verbosity=1, file_mode='w', convert_numpy_to_native=False, h5path='/'):
     ''' Save a nested dictionary data structure to an HDF5 file. 
 
     Args:
@@ -19,6 +19,8 @@ def save_to_h5(filename, data, serialize=True, compression=None, json_compressio
         compression (string): h5py compression type (e.g. 'gzip', 'lzf' or None)
         json_compression (string): h5py compression type for serialized JSON (default: 'gzip')
         file_mode (string): h5py.File access mode. 'w' (default) for create/detete and 'a' for create/append
+        convert_numpy_to_native (boolean): convert numpy types to native python types
+        h5path (string): path within the HDF5 file to save the data
 
     based on https://github.com/danionella/lib2p/blob/master/lib2putils.py
     '''

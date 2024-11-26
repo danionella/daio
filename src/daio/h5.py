@@ -97,7 +97,7 @@ def load_from_h5(filename):
 
     filename = expanduser(filename)
     with h5py.File(filename, 'r') as h5file:
-        return recursively_load_contents_from_group(h5file, '/')
+        return recursively_load_contents_from_group(h5file, h5path)
     
 
 class lazyh5:

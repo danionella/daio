@@ -124,7 +124,8 @@ class lazyh5:
             list: List of keys in the current HDF5 group.
         """
         with h5py.File(self._filepath, 'r') as f:
-            return list(f[self._h5path].keys())
+            out = list(f[self._h5path].keys())
+        return out
 
     def __getitem__(self, key):
         """Gets an item by key."""

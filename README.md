@@ -63,10 +63,6 @@ b_loaded = h5['b']
 e_loaded = h5['c']['e']
 h5.keys()
 ```
-In Jupyter, you can interactively explore the file structure:
-
-<img width="484" alt="image" src="https://github.com/user-attachments/assets/87030329-1ebc-4a77-a1af-b04a83be74d2">
-
 
 Create a new HDF5 file (or add items to existing file by setting argument `readonly=False`):
 ```python
@@ -86,7 +82,14 @@ lazyh5('/path/to/datafile.h5').from_dict(some_dict)
 loaded = lazyh5('/path/to/datafile.h5').to_dict()
 ```
 
-Old interface:
+In Jupyter, you can interactively explore the file structure:
+
+<img width="598" alt="image" src="https://github.com/user-attachments/assets/878d4af6-ce26-4ec3-9ba5-2701fba1c07e">
+
+
+-----
+<details><summary>Old interface (expand this)</summary>
+    
 ```python
 from daio.h5 import save_to_h5, load_from_h5
 # save dict to HDF5 file:
@@ -95,3 +98,5 @@ save_to_h5('/path/to/datafile.h5', some_dict)
 # load dict from HDF5 file:
 dict_loaded = load_from_h5('/path/to/datafile.h5')
 ```
+
+</details>

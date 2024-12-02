@@ -60,9 +60,13 @@ Lazily load HDF5 with a dict-like interface (contents are only loaded when acces
 from daio.h5 import lazyh5
 h5 = lazyh5('/path/to/datafile.h5')
 b_loaded = h5['b']
-g_loaded = h5['c']['g']
+e_loaded = h5['c']['e']
 h5.keys()
 ```
+In Jupyter, you can interactively explore the file structure:
+
+<img width="484" alt="image" src="https://github.com/user-attachments/assets/87030329-1ebc-4a77-a1af-b04a83be74d2">
+
 
 Create a new HDF5 file (or add items to existing file by setting argument `readonly=False`):
 ```python

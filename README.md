@@ -55,22 +55,39 @@ with VideoReader('/path/to/video.mp4') as reader:
 
 ### HDF5 file IO
 
-Write a Python dict to a HDF5 file:
-```python
-from daio.h5 import save_to_h5, load_from_h5, lazyh5
-some_dict = dict(a = 1, b = np.random.randn(3,4,5), c = dict(g='nested'), d = 'some_string')
-save_to_h5('/path/to/datafile.h5', some_dict)
-```
-
-Load HDF5 contents to dict:
-```python
-dict_loaded = load_from_h5('/path/to/datafile.h5', d)
-```
-
 Lazily load HDF5 with a dict-like interface (contents are only loaded when accessed):
 ```python
+from daio.h5 import lazyh5
 h5 = lazyh5('/path/to/datafile.h5')
 b_loaded = h5['b']
 g_loaded = h5['c']['g']
 h5.keys()
+```
+
+Create a new HDF5 file (or add items to existing file by setting argument `readonly=False`):
+```python
+h5 = lazyh5('test.h5')
+h5['a'] = 1
+h5['b'] = 'hello'
+h5['c'] = {} # create subgroup
+h5['c']['e'] = [2,3,4]
+```
+
+Load entire HDF5-file to dict, or save dict to HDF5-file:
+```python
+# save dict to HDF5 file:
+some_dict = dict(a = 1, b = np.random.randn(3,4,5), c = dict(g='nested'), d = 'some_string')
+lazyh5('/path/to/datafile.h5').from_dict(some_dict)
+# load dict from HDF5 file:
+loaded = lazyh5('/path/to/datafile.h5').to_dict()
+```
+
+Old interface:
+```python
+from daio.h5 import save_to_h5, load_from_h5
+# save dict to HDF5 file:
+some_dict = dict(a = 1, b = np.random.randn(3,4,5), c = dict(g='nested'), d = 'some_string')
+save_to_h5('/path/to/datafile.h5', some_dict)
+# load dict from HDF5 file:
+dict_loaded = load_from_h5('/path/to/datafile.h5')
 ```

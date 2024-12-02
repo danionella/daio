@@ -180,6 +180,10 @@ class lazyh5:
                 return item[()]
             else:
                 raise KeyError(f"Unknown item type for key: {key}")
+            
+    def __setitem__(self, key, value):
+        """Sets an item by key."""
+        self.from_dict({key: value})
 
     def __getattr__(self, key):
         """Provides dynamic attribute-style access."""

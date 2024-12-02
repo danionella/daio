@@ -30,7 +30,7 @@ def save_to_h5(filename, data, serialize=True, compression=None, json_compressio
         for key, item in data_item.items():
             if verbosity > 1:
                 print('saving entry: {} -- {}'.format(path + key, type(item)))
-            if isinstance(item, (np.ndarray, np.int64, np.float64, str, bytes, int, float)):
+            if isinstance(item, (np.ndarray, np.int64, np.float64, str, bytes, int, float)) or is_h5py_compatible_array(item):
                 comp = None if np.isscalar(item) else compression
                 try:
                     h5file[path].create_dataset(key, data=item, compression=comp)
@@ -250,3 +250,15 @@ class lazyh5:
         """Displays a summary of the object in IPython."""
         from IPython.display import JSON
         display(JSON(self.inspect_structure(), root='/'))
+
+
+def is_h5py_compatible_array(obj):
+    if isinstance(obj, (list, tuple)):
+        try:
+            # Ensure it can be converted to a numerical numpy array
+            arr = np.asarray(obj)
+            # Check if it is a numerical or string array (h5py supports these)
+            return np.issubdtype(arr.dtype, np.number) or arr.dtype.char in {'S', 'U'}
+        except (ValueError, TypeError):
+            return False
+    return False

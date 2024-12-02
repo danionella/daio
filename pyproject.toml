@@ -20,6 +20,11 @@ dependencies = [
 [project.urls]
 Homepage = "https://github.com/danionella/daio"
 
+[project.optional-dependencies]
+h5 = ["h5py","hdf5plugin"]
+video = ["av"]
+all = ["av","h5py","hdf5plugin"]
+
 [tool.setuptools.packages.find]
 where = ["src"]
 include = ["daio*"]

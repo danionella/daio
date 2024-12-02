@@ -1,7 +1,7 @@
 import json, os
 #TODO: test replacing json with orjson
 import warnings
-from os.path import expanduser
+from os.path import expanduser, isfile
 
 import numpy as np
 import h5py
@@ -109,12 +109,14 @@ class lazyh5:
     Args:
             filepath (str): Path to the HDF5 file.
             h5path (str, optional): HDF5 group path. Defaults to '/'.
-            readonly (str, optional): Whether to open the file in read-only mode. Defaults to False.
+            readonly (str, optional): Whether to open the file in read-only mode. Defaults to None (read-only iff file exists).
     """
 
-    def __init__(self, filepath, h5path='/', readonly=True):
+    def __init__(self, filepath, h5path='/', readonly=None):
         self._filepath = filepath
         self._h5path = h5path
+        if readonly is None:
+            readonly = isfile(filepath)
         self._readonly = readonly
 
     def keys(self):
@@ -171,7 +173,7 @@ class lazyh5:
         with h5py.File(self._filepath, 'r') as f:
             item = f[self._h5path][key]
             if isinstance(item, h5py.Group):
-                return lazyh5(self._filepath, h5path=f"{self._h5path}/{key}".lstrip('/'))
+                return lazyh5(self._filepath, h5path=f"{self._h5path}/{key}".lstrip('/'), readonly=self._readonly)
             elif isinstance(item, h5py.Dataset):
                 if h5py.check_string_dtype(item.dtype) is not None:
                     item = item.asstr()

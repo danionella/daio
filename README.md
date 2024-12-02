@@ -32,7 +32,7 @@ for i in range(20):
 writer.close()
 ```
 
-Read video:
+Read video using speed-optimized array-like indexing or iteration:
 ```python
 reader = VideoReader('/path/to/video.mp4')
 frame_7 = reader[7]

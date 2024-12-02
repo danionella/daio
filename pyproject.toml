@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "daio"
-version = "0.0.2"
+version = "0.0.3"
 description = "video and data IO tools for Python"
 authors = [
     { name = "jlab.berlin" },
@@ -13,9 +13,7 @@ license = {text = "MIT"}
 readme = "README.md"
 keywords = ["python", "HDF5", "data IO", "video IO"]
 requires-python = ">=3.8"
-dependencies = [
-    "numpy","tqdm","av","h5py","hdf5plugin"
-]
+dependencies = ["numpy"]
 
 [project.urls]
 Homepage = "https://github.com/danionella/daio"

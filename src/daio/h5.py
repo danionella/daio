@@ -1,5 +1,8 @@
-import json, os
-#TODO: test replacing json with orjson
+try: 
+    # use orjson, if installed
+    import orjson as json
+except ImportError:
+    import json
 import warnings
 from os.path import expanduser, isfile
 

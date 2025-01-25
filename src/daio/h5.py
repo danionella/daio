@@ -1,15 +1,16 @@
+import warnings
+from os.path import expanduser, isfile, exists
+
 try: 
-    # use orjson, if installed
     import orjson as json
 except ImportError:
     import json
-import warnings
-from os.path import expanduser, isfile, exists
 
 import numpy as np
 import h5py
 #import hdf5plugin
 #TODO: test defaulting to hdf5plugin.Zstd compression for json-serialized strings
+
 
 
 def save_to_h5(filename, data, serialize=True, compression=None, json_compression='gzip', verbosity=1, file_mode='w', convert_numpy_to_native=False, h5path='/'):
@@ -106,8 +107,8 @@ def load_from_h5(filename, h5path='/'):
 class lazyh5:
     """ A lazy-loading interface for HDF5 files. 
     
-    This class provides an easy way to access HDF5 file content without fully
-    loading it into memory. It supports dynamic access to datasets and subgroups.
+    This class provides an easy way to access HDF5 file content without fully loading it into 
+    memory or keeping the file open. It supports dynamic access to datasets and subgroups.
 
     Args:
             filepath (str): Path to the HDF5 file.

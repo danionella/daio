@@ -1,10 +1,11 @@
+import os
 try: 
     # use orjson, if installed
     import orjson as json
 except ImportError:
     import json
 import warnings
-from os.path import expanduser, isfile
+from os.path import expanduser, isfile, exists
 
 import numpy as np
 import h5py
@@ -148,7 +149,7 @@ class lazyh5:
         """
         if self._readonly:
             raise ValueError("Cannot add data to a read-only lazyh5 object.")
-        if os.path.exists(self._filepath):
+        if exists(self._filepath):
             with h5py.File(self._filepath, 'r') as f:
                 for k, v in data.items():
                     if (self._h5path+'/'+k in f):
@@ -164,7 +165,7 @@ class lazyh5:
         if self._readonly:
             raise ValueError("Cannot remove data from a read-only lazyh5 object.")
         else:
-            if os.path.exists(self._filepath):
+            if exists(self._filepath):
                 with h5py.File(self._filepath, 'a') as f:
                     if key in f[self._h5path]:
                         del f[self._h5path][key]

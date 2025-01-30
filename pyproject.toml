@@ -13,15 +13,10 @@ license = {text = "MIT"}
 readme = "README.md"
 keywords = ["python", "HDF5", "data IO", "video IO"]
 requires-python = ">=3.8"
-dependencies = ["numpy"]
+dependencies = ["numpy","av","h5py","hdf5plugin"]
 
 [project.urls]
 Homepage = "https://github.com/danionella/daio"
-
-[project.optional-dependencies]
-h5 = ["h5py","hdf5plugin"]
-video = ["av"]
-all = ["av","h5py","hdf5plugin"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

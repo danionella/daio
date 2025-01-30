@@ -6,6 +6,6 @@ dependencies:
   - python>=3.8
   - pip
   - numpy
-  - av
+  - av < 14
   - h5py
   - hdf5plugin

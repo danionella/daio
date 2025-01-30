@@ -9,4 +9,3 @@ dependencies:
   - av
   - h5py
   - hdf5plugin
-  - tqdm

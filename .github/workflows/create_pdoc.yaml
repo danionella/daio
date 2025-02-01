@@ -28,7 +28,6 @@ jobs:
           channels: conda-forge
           auto-activate-base: false
           activate-environment: docs
-          environment-file: environment.yml
           use-mamba: true
       - name: Install pdoc
         run: |

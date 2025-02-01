@@ -13,10 +13,6 @@ Links: [API documentation](http://danionella.github.io/daio), [GitHub repository
 ## Installation
 - via conda or mamba: `conda install conda-forge::daio`
 - if you prefer pip: `pip install daio`
-- for development, clone this repository change to the directory containing `pyproject.toml` 
-    - `conda env create -n env_name -f environment.yml`
-    - `conda activate env_name`
-    - `pip install -e .`
 
 ## Use 
 

@@ -144,7 +144,7 @@ class lazyh5:
         """
         return load_from_h5(self._filepath, h5path=self._h5path)
     
-    def from_dict(self, data):
+    def from_dict(self, data, compression=None, json_compression='gzip', overwrite=False):
         """Writes a dictionary to the HDF5 file or group.
 
         Args:
@@ -153,11 +153,15 @@ class lazyh5:
         if self._readonly:
             raise ValueError("Cannot add data to a read-only lazyh5 object.")
         if exists(self._filepath):
-            with h5py.File(self._filepath, 'r') as f:
+            with h5py.File(self._filepath, 'a') as f:
                 for k, v in data.items():
                     if (self._h5path+'/'+k in f):
-                        raise AttributeError(f"Dataset or group '{k}' already exists!")
-        save_to_h5(self._filepath, data, h5path=self._h5path, file_mode='a')
+                        if overwrite:
+                            del f[self._h5path][k]
+                        else:
+                            raise AttributeError(f"Dataset or group '{k}' already exists!")
+        save_to_h5(self._filepath, data, h5path=self._h5path, file_mode='a', compression=compression, json_compression=json_compression)
+        return self
 
     def remove_key(self, key):
         """Removes the HDF5 dataset or group. Note this does not free up space in the file.

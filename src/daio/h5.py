@@ -8,7 +8,7 @@ except ImportError:
 
 import numpy as np
 import h5py
-#import hdf5plugin
+import hdf5plugin
 #TODO: test defaulting to hdf5plugin.Zstd compression for json-serialized strings
 
 
@@ -20,7 +20,7 @@ def save_to_h5(filename, data, serialize=True, compression=None, json_compressio
         filename (string): file name of the HDF5 file
         data (dict): Nested dictionary whose contents may be dict, ndarray, str, bytes, DataFrame and JSON-serializable objects
         serialize (boolean): enable JSON serialization
-        compression (string): h5py compression type (e.g. 'gzip', 'lzf' or None)
+        compression (string): h5py compression type (e.g. 'gzip', 'lzf', 'zstd' or None)
         json_compression (string): h5py compression type for serialized JSON (default: 'gzip')
         file_mode (string): h5py.File access mode. 'w' (default) for create/detete and 'a' for create/append
         convert_numpy_to_native (boolean): convert numpy types to native python types
@@ -28,7 +28,10 @@ def save_to_h5(filename, data, serialize=True, compression=None, json_compressio
 
     based on https://github.com/danionella/lib2p/blob/master/lib2putils.py
     '''
-
+    if compression == 'zstd':
+        compression = hdf5plugin.Zstd()
+    if json_compression == 'zstd':
+        json_compression = hdf5plugin.Zstd()
     def recursively_save_contents_to_group(h5file, path, data_item):
         assert isinstance(data_item, (dict))
         for key, item in data_item.items():
@@ -259,7 +262,7 @@ class lazyh5:
     def _ipython_display_(self):
         """Displays a summary of the object in IPython."""
         from IPython.display import JSON
-        display(JSON(self.inspect_structure(), root='/'))
+        display(JSON(self.inspect_structure(), root=self._filepath))
 
 
 def is_h5py_compatible_array(obj):

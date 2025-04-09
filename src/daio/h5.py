@@ -1,4 +1,4 @@
-import warnings
+import warnings, os
 from os.path import expanduser, isfile, exists
 
 try: 
@@ -117,11 +117,14 @@ class lazyh5:
             filepath (str): Path to the HDF5 file.
             h5path (str, optional): HDF5 group path. Defaults to '/'.
             readonly (str, optional): Whether to open the file in read-only mode. Defaults to None (read-only iff file exists).
+            erase_existing (bool, optional): Whether to erase existing file. Defaults to False.
     """
 
-    def __init__(self, filepath, h5path='/', readonly=None):
+    def __init__(self, filepath, h5path='/', readonly=None, erase_existing=False):
         self._filepath = filepath
         self._h5path = h5path
+        if erase_existing and isfile(filepath):
+            os.remove(filepath)
         if readonly is None:
             readonly = isfile(filepath)
         self._readonly = readonly

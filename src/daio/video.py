@@ -174,11 +174,14 @@ class VideoWriter:
 
     def __init__(self, filename, codec='libx264', fps=25, frame_shape=None, pix_fmt='yuv420p', **kwargs):
         self.container = av.open(filename, mode='w')
+        self.audio_stream = None
         #define codec defaults:
         if codec == 'h264':
-            kwargs = dict(bit_rate=1000000, pix_fmt='yuv420p').update(kwargs)
+            #kwargs = dict(bit_rate=1000000, pix_fmt='yuv420p').update(kwargs)
+            kwargs = {**dict(bit_rate=1000000), **kwargs}
         elif codec == 'libx264':
-            kwargs = dict(crf=23, preset='superfast', pix_fmt='yuv420p').update(kwargs)
+            #kwargs = dict(crf=23, preset='superfast', pix_fmt='yuv420p').update(kwargs)
+            kwargs = {**dict(crf=23, preset='superfast'), **kwargs}
         #add video stream, if frame_shape is provided (otherwise create when the first frame is written)
         if frame_shape is not None:
             self.stream = self.container.add_stream(codec, rate=fps, height=frame_shape[0], width=frame_shape[1], pix_fmt=pix_fmt, **kwargs)
@@ -189,11 +192,12 @@ class VideoWriter:
             self.pix_fmt = pix_fmt
             self.kwargs = kwargs if kwargs is not None else {}
 
-    def write(self, im):
+    def write(self, im, pts=None):
         """ Write a frame to the video file
         
         Args:
             im (np.ndarray): frame to write
+            pts (int): presentation timestamp of the frame. Default is None (don't use unles you know what you are doing)
         """
         if im.ndim == 2:
             format = 'gray'
@@ -204,6 +208,8 @@ class VideoWriter:
         if self.stream is None:
             self.stream = self.container.add_stream(self.codec, rate=self.fps, height=im.shape[0], width=im.shape[1], pix_fmt=self.pix_fmt, **self.kwargs)
         out_frame = av.VideoFrame.from_ndarray(im, format=format)
+        if pts is not None:
+            out_frame.pts = pts
         for packet in self.stream.encode(out_frame):
             self.container.mux(packet)
 

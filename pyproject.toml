@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "daio"
-version = "0.0.8"
+version = "0.0.9"
 description = "video and data IO tools for Python"
 authors = [
     { name = "jlab.berlin" },

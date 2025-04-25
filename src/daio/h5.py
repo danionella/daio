@@ -51,7 +51,8 @@ def save_to_h5(filename, data, serialize=True, compression=None, json_compressio
                 if verbosity > 0:
                     print(f'serializing {type(item)} at {path+key}', flush=True)
                 #TODO: test replacing json with orjson
-                json_bytes = json.dumps(item).encode('utf-8')
+                encoder_default = lambda o: o.item() if isinstance(o, np.generic) else json.JSONEncoder().default(o)
+                json_bytes = json.dumps(item, default=encoder_default).encode('utf-8')
                 h5file[path].create_dataset(key, data=np.frombuffer(json_bytes, dtype='byte'), compression=json_compression)
                 h5file[path + key].attrs['json_type'] = f'This {type(item)} was JSON serialized and UTF-8 encoded.'
             else:
@@ -265,7 +266,8 @@ class lazyh5:
     def _ipython_display_(self):
         """Displays a summary of the object in IPython."""
         from IPython.display import JSON
-        display(JSON(self.inspect_structure(), root=self._filepath))
+        safe = json.loads(json.dumps(self.inspect_structure(), default=lambda o: o.item() if isinstance(o, np.generic) else str(o)))
+        display(JSON(safe, root=self._filepath))
 
 
 def is_h5py_compatible_array(obj):

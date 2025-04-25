@@ -142,7 +142,7 @@ class lazyh5:
         Returns:
             dict: A dictionary representation of the HDF5 file.
         """
-        return load_from_h5(self._filepath, h5path=self._h5path)
+        return load_from_h5(self._filepath, h5path=self._h5path+'/')
     
     def from_dict(self, data, compression=None, json_compression='gzip', overwrite=False):
         """Writes a dictionary to the HDF5 file or group.

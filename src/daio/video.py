@@ -206,7 +206,7 @@ class VideoWriter:
         else:
             raise ValueError(f"Unsupported frame shape: {im.shape}")
         if self.stream is None:
-            self.stream = self.container.add_stream(self.codec, rate=self.fps, height=im.shape[0], width=im.shape[1], pix_fmt=self.pix_fmt, **self.kwargs)
+            self.stream = self.container.add_stream(self.codec, rate=self.fps, height=im.shape[0], width=im.shape[1], pix_fmt=self.pix_fmt, options=self.kwargs)
         out_frame = av.VideoFrame.from_ndarray(im, format=format)
         if pts is not None:
             out_frame.pts = pts

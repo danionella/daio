@@ -178,10 +178,10 @@ class VideoWriter:
         #define codec defaults:
         if codec == 'h264':
             #kwargs = dict(bit_rate=1000000, pix_fmt='yuv420p').update(kwargs)
-            kwargs = {**dict(bit_rate=1000000), **kwargs}
+            kwargs = {**dict(bit_rate='1000000'), **kwargs}
         elif codec == 'libx264':
             #kwargs = dict(crf=23, preset='superfast', pix_fmt='yuv420p').update(kwargs)
-            kwargs = {**dict(crf=23, preset='superfast'), **kwargs}
+            kwargs = {**dict(crf='23', preset='superfast'), **kwargs}
         #add video stream, if frame_shape is provided (otherwise create when the first frame is written)
         if frame_shape is not None:
             self.stream = self.container.add_stream(codec, rate=fps, height=frame_shape[0], width=frame_shape[1], pix_fmt=pix_fmt, options=kwargs)

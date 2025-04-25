@@ -184,7 +184,7 @@ class VideoWriter:
             kwargs = {**dict(crf=23, preset='superfast'), **kwargs}
         #add video stream, if frame_shape is provided (otherwise create when the first frame is written)
         if frame_shape is not None:
-            self.stream = self.container.add_stream(codec, rate=fps, height=frame_shape[0], width=frame_shape[1], pix_fmt=pix_fmt, **kwargs)
+            self.stream = self.container.add_stream(codec, rate=fps, height=frame_shape[0], width=frame_shape[1], pix_fmt=pix_fmt, options=kwargs)
         else:
             self.stream = None
             self.codec = codec

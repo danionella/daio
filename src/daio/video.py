@@ -26,8 +26,6 @@ class VideoReader:
         self._frame_to_pts = lambda n: round(n * self._pts_per_frame) + self.stream.start_time
         self.wiggle_pts = tolerance * self._pts_per_frame
         self.rewind()
-        if self.container.format.variable_fps:
-            warn_transcode(f'Variable frame rate video detected. Seeking will likely be unrealiable. I will warn again if I detect seek gitches')
         if self.stream.average_rate != self.stream.guessed_rate:
             warn_transcode(f'Average frame rate ({self.stream.average_rate}) is different from nominal frame rate ({self.stream.guessed_rate}). Seeking may be unrealiable. I will warn again if I detect seek gitches')
 

@@ -6,7 +6,7 @@
 ![GitHub last commit](https://img.shields.io/github/last-commit/danionella/daio)
 
 # daio
-Video and data IO tools for Python.
+Speed-optimized, frame-accurate video and data IO tools for Python.
 
 Links: [API documentation](http://danionella.github.io/daio), [GitHub repository](https://github.com/danionella/daio)
 

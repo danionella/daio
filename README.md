@@ -10,6 +10,17 @@ Video and data IO tools for Python.
 
 Links: [API documentation](http://danionella.github.io/daio), [GitHub repository](https://github.com/danionella/daio)
 
+## Features
+
+#### Video IO
+- **Efficient Video Reading**: Use `VideoReader` for fast frame-accurate video reading with support for array-like indexing and iteration.
+- **Video Writing**: Write video files easily with `VideoWriter`, supporting multiple codecs and pixel formats.
+
+#### HDF5 File IO
+- **Lazy Loading**: Access HDF5 files with a dictionary-like interface using `lazyh5`, loading data only when accessed.
+- **Nested Data Support**: Save and load nested dictionaries, including arrays, strings, and JSON-serializable objects.
+- **Interactive Exploration**: Explore HDF5 file structures interactively in Jupyter notebooks.
+
 ## Installation
 - via conda or mamba: `conda install conda-forge::daio`
 - if you prefer pip: `pip install daio`

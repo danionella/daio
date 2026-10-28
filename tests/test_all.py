@@ -19,6 +19,8 @@ def test_video(tmp_path):
             writer.write(frame)
     
     with VideoReader(filename) as reader:
+        assert reader.shape == (20, 720, 1280)
+        assert reader.size == 20 * 720 * 1280
         for frame in reader:
             frame.mean()
 

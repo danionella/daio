@@ -22,11 +22,13 @@ jobs:
       run:
         shell: bash -l {0}
     steps:
-      - uses: actions/checkout@v3
-      - uses: conda-incubator/setup-miniconda@v3
+      - uses: actions/checkout@v7
+      - uses: conda-incubator/setup-miniconda@v4
         with:
           channels: conda-forge
-          auto-activate-base: false
+          conda-remove-defaults: "true"
+          python-version: "3.13"
+          auto-activate: false
           activate-environment: docs
           use-mamba: true
       - name: Install pdoc
@@ -38,7 +40,7 @@ jobs:
           conda activate docs
           pip install -e .
           pdoc --docformat google src/daio -o docs
-      - uses: actions/upload-pages-artifact@v3
+      - uses: actions/upload-pages-artifact@v5
         with:
           path: docs/
 
@@ -55,4 +57,4 @@ jobs:
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - id: deployment
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@v5

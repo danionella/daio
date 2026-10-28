@@ -29,19 +29,14 @@ jobs:
       run:
         shell: bash -l {0}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
-        with:
-          python-version: ${{ matrix.python-version }}
-      
-      - uses: conda-incubator/setup-miniconda@v3
+      - uses: conda-incubator/setup-miniconda@v4
         with:
           channels: conda-forge
           conda-remove-defaults: "true"
           python-version: ${{ matrix.python-version }}
-          auto-activate-base: false
+          auto-activate: false
           activate-environment: tests
           use-mamba: true
 

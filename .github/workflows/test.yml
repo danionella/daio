@@ -20,9 +20,10 @@ jobs:
     runs-on: ${{ matrix.platform }}
     timeout-minutes: 30
     strategy:
+      fail-fast: false
       matrix:
         platform: [ubuntu-latest, windows-latest, macos-latest]
-        python-version: ["3.8"]
+        python-version: ["3.8", "3.13"]
 
     defaults:
       run:
@@ -39,6 +40,7 @@ jobs:
         with:
           channels: conda-forge
           conda-remove-defaults: "true"
+          python-version: ${{ matrix.python-version }}
           auto-activate-base: false
           activate-environment: tests
           use-mamba: true

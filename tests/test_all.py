@@ -129,3 +129,15 @@ def test_hdf5_serialization(tmp_path):
     assert np.array_equal(loaded_data['b']['nested'], data['b']['nested'])
     assert loaded_data['c'] == data['c']
 
+
+def test_hdf5_numpy_to_native(tmp_path):
+    import h5py
+    data = {'a': np.float32(1.5), 'b': {'c': np.int32(3)}, 'd': [np.float32(1), np.float32(2)], 'e': np.arange(3)}
+    filename = tmp_path / 'test_native.h5'
+    save_to_h5(filename, data, convert_numpy_to_native=True, verbosity=0)
+    with h5py.File(filename, 'r') as f:
+        assert 'json_type' not in f['a'].attrs   # stored as an HDF5 scalar, not serialized
+        assert 'json_type' not in f['b/c'].attrs
+    data2 = load_from_h5(filename)
+    assert data2['a'] == 1.5 and data2['b']['c'] == 3
+    assert np.array_equal(data2['d'], [1., 2.]) and np.array_equal(data2['e'], np.arange(3))

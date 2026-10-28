@@ -59,7 +59,7 @@ def save_to_h5(filename, data, serialize=True, compression=None, json_compressio
                 raise ValueError(f'Cannot save {type(item)} to {path+key}. Consider enabling serialisation.')
 
     if convert_numpy_to_native:
-        data = convert_numpy_to_native(data)
+        data = _numpy_to_native(data)
 
     filename = expanduser(filename)
     with h5py.File(filename, file_mode) as h5file:
@@ -268,6 +268,17 @@ class lazyh5:
         from IPython.display import JSON
         safe = json.loads(json.dumps(self.inspect_structure(), default=lambda o: o.item() if isinstance(o, np.generic) else str(o)))
         display(JSON(safe, root=self._filepath))
+
+
+def _numpy_to_native(obj):
+    ''' Recursively convert numpy scalars (np.generic) to native Python types; arrays are left as they are. '''
+    if isinstance(obj, dict):
+        return {k: _numpy_to_native(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return type(obj)(_numpy_to_native(v) for v in obj)
+    if isinstance(obj, np.generic):
+        return obj.item()
+    return obj
 
 
 def is_h5py_compatible_array(obj):

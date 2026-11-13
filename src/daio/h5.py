@@ -41,6 +41,8 @@ def _save(filename, data, serialize=True, compression=None, json_compression='gz
           convert_numpy_to_native=False, h5path='/', overwrite=False):
     opts = dict(serialize=serialize, verbosity=verbosity, compression=_compression_filter(compression),
                 json_compression=_compression_filter(json_compression))
+    for comp in (opts['compression'], opts['json_compression']):
+        _check_compression(comp)
     if convert_numpy_to_native:
         data = _numpy_to_native(data)
     h5path = _normalize_h5path(h5path)
@@ -63,6 +65,14 @@ def load_from_h5(filename, h5path='/'):
     filename = expanduser(filename)
     with h5py.File(filename, 'r') as h5file:
         return _read_group(h5file[_normalize_h5path(h5path)], filename)
+
+
+def _check_compression(compression):
+    """ Raise (before any file is opened) if a compression filter is not available. """
+    if compression is None:
+        return
+    with h5py.File(io.BytesIO(), 'w') as f:
+        f.create_dataset('test', data=np.zeros(4), compression=compression)
 
 
 def _normalize_h5path(h5path):
@@ -138,9 +148,9 @@ def _native(item):
             return item, None, {}
         return None
     if isinstance(item, np.ndarray):
-        if item.dtype.kind == 'U' or (item.dtype.kind == 'O' and _all_str(item)):
-            return item.astype(object), h5py.string_dtype(), {}
-        if item.dtype.kind == 'O':
+        if item.dtype.kind in 'UO':
+            if _all_str(item.astype(object)): # (str without NUL characters)
+                return item.astype(object), h5py.string_dtype(), {}
             return None
         return item, None, {}
     if isinstance(item, (list, tuple)):
@@ -159,6 +169,12 @@ def _prepare_group(data, path, opts):
     for key, item in data.items():
         if not isinstance(key, str):
             raise TypeError(f'Cannot save key {key!r} in {path}: keys must be strings.')
+        parts = key.split('/')
+        if not key or any(part in ('', '.', '..') for part in parts):
+            raise ValueError(f'Cannot save key {key!r} in {path}: not a valid HDF5 name.')
+        for k in range(1, len(parts)): # 'a/b' creates group 'a': it must not collide with another key 'a'
+            if '/'.join(parts[:k]) in data:
+                raise ValueError(f"Cannot save key {key!r} in {path}: collides with key {'/'.join(parts[:k])!r}.")
         out[key] = _prepare_item(item, posixpath.join(path, key), opts)
     return ('group', out)
 
@@ -215,24 +231,36 @@ def _write_node(group, key, node):
 def _write_items(group, prepared, overwrite=False):
     """ Write prepared items into group. Existing keys raise KeyExistsError (before anything is written), or are
     replaced if overwrite is True: the new item is written under a temporary name first, so that the old item is
-    only removed once the new one was written successfully. """
+    only removed once the new one was written successfully. A new item that fails to write is removed again. """
     items = prepared[1]
     existing = [key for key in items if key in group]
     if existing and not overwrite:
         raise KeyExistsError(f"Dataset or group {', '.join(repr(k) for k in existing)} already exists in '{group.name}'!")
     for key, node in items.items():
         if key not in group:
-            _write_node(group, key, node)
+            try:
+                _write_node(group, key, node)
+            except BaseException: # do not leave a partially written item behind
+                if key in group:
+                    del group[key]
+                raise
             continue
-        tmp = f'__daio_tmp_{uuid.uuid4().hex}'
+        tmp, backup = f'__daio_tmp_{uuid.uuid4().hex}', f'__daio_old_{uuid.uuid4().hex}'
         try:
             _write_node(group, tmp, node)
         except BaseException:
             if tmp in group:
                 del group[tmp]
             raise
-        del group[key]
-        group.move(tmp, key)
+        group.move(key, backup) # swap via a backup name, so that the original is never lost
+        try:
+            group.move(tmp, key)
+        except BaseException:
+            group.move(backup, key)
+            if tmp in group:
+                del group[tmp]
+            raise
+        del group[backup]
 
 
 def _read_dataset(item):
@@ -364,8 +392,8 @@ class lazyh5:
 
     def __getattr__(self, key):
         """Provides dynamic attribute-style access."""
-        if key.startswith('_'): # private and special attributes (e.g. looked up by copy, pickle or IPython)
-            raise AttributeError(key)
+        if key.startswith('__') or key in ('_filepath', '_h5path', '_readonly'):
+            raise AttributeError(key) # special and internal attributes (e.g. looked up by copy, pickle or IPython)
         try:
             return self[key]
         except (KeyError, FileNotFoundError):

@@ -442,6 +442,62 @@ def test_lazyh5_overwrite_keeps_old_data_on_failure(tmp_path, monkeypatch):
         h5['x'] = 1
 
 
+def test_save_to_h5_write_time_errors_do_not_destroy_file(tmp_path):
+    """ Errors that h5py would only raise after opening the file are caught before it is opened. """
+    import pytest
+    filename = tmp_path / 'precious.h5'
+    save_to_h5(filename, {'precious': np.arange(3)}, verbosity=0)
+    for bad, kwargs in [({'a': 1, '': 2}, {}), ({'.': 1}, {}), ({'a': 1, 'a/b': 2}, {}), ({'a': np.arange(4)}, {'compression': 'foo'})]:
+        with pytest.raises(ValueError):
+            save_to_h5(filename, bad, verbosity=0, **kwargs)
+        assert np.array_equal(load_from_h5(filename)['precious'], np.arange(3)), bad
+    # str arrays containing NUL characters (not supported by HDF5 strings) are stored as JSON
+    save_to_h5(filename, {'s': np.array(['a\x00b', 'c'])}, verbosity=0)
+    assert list(load_from_h5(filename)['s']) == ['a\x00b', 'c']
+
+
+def test_lazyh5_failed_new_key_is_removed(tmp_path, monkeypatch):
+    import pytest
+    import daio.h5
+    h5 = lazyh5(tmp_path / 'partial.h5')
+    original = daio.h5._write_node
+    def failing_write_node(group, key, node):
+        if key == 'bad':
+            raise OSError('simulated write error')
+        original(group, key, node)
+    monkeypatch.setattr(daio.h5, '_write_node', failing_write_node)
+    with pytest.raises(OSError):
+        h5.from_dict({'y': {'ok': 1, 'bad': 2}})
+    monkeypatch.undo()
+    assert h5.keys() == [] # no partially written group 'y' left behind
+    h5.from_dict({'y': {'ok': 1}}) # retrying works
+    assert h5['y']['ok'] == 1
+
+
+def test_lazyh5_overwrite_swap_never_loses_original(tmp_path, monkeypatch):
+    import pytest
+    import h5py
+    h5 = lazyh5(tmp_path / 'swap.h5')
+    h5['x'] = np.arange(5)
+    original_move = h5py.Group.move
+    def interrupted_move(self, source, dest):
+        if source.startswith('__daio_tmp_'):
+            raise KeyboardInterrupt
+        return original_move(self, source, dest)
+    monkeypatch.setattr(h5py.Group, 'move', interrupted_move)
+    with pytest.raises(KeyboardInterrupt):
+        h5.from_dict({'x': np.zeros(3)}, overwrite=True)
+    monkeypatch.undo()
+    assert np.array_equal(h5['x'], np.arange(5))
+    assert h5.keys() == ['x'] # no temporary items left behind
+
+
+def test_lazyh5_attribute_access_to_underscore_keys(tmp_path):
+    h5 = lazyh5(tmp_path / 'underscore.h5')
+    h5['_meta'] = 5
+    assert h5._meta == 5 # attribute access works for keys starting with '_', as in earlier versions
+
+
 def test_hdf5_dataframe(tmp_path):
     import pytest
     pd = pytest.importorskip('pandas')

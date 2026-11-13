@@ -528,6 +528,7 @@ def test_hdf5_review_followups(tmp_path, monkeypatch):
     assert h5.keys() == []
     # '~' is expanded consistently
     monkeypatch.setenv('HOME', str(tmp_path))
+    monkeypatch.setenv('USERPROFILE', str(tmp_path)) # (used by expanduser on Windows)
     home = lazyh5('~/home.h5')
     home['a'] = 1
     assert home.keys() == ['a'] and home['a'] == 1 and (tmp_path / 'home.h5').exists()

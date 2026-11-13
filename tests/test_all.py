@@ -299,6 +299,42 @@ def test_videowriter_misc_validation(tmp_path):
     with pytest.warns(UserWarning, match='no file'): # declared audio stream, but nothing written
         VideoWriter(tmp_path / 'empty_audio.mp4', audio_rate=44100).close()
 
+def test_videowriter_review_followups(tmp_path):
+    import pytest
+    from fractions import Fraction
+    # low float frame rates are not rounded to 0; invalid rates raise
+    for fps, expected in [(1e-4, Fraction(1, 10000)), (0.0005, Fraction(1, 2000)), (30000 / 1001, Fraction(30000, 1001))]:
+        with VideoWriter(tmp_path / 'fps.mkv', fps=fps) as writer:
+            writer.write(np.zeros((64, 96), np.uint8))
+        assert writer.fps == expected, fps
+    for fps in [0, -1, 0.0, float('nan')]:
+        with pytest.raises(ValueError):
+            VideoWriter(tmp_path / 'badfps.mp4', fps=fps)
+    # the video stream comes first, also if an audio stream is declared
+    filename = tmp_path / 'order.mp4'
+    with VideoWriter(filename, frame_shape=(64, 96), audio_rate=44100) as writer:
+        writer.write_audio(np.zeros(44100, np.float32))
+        writer.write(np.zeros((64, 96), np.uint8))
+    import av
+    with av.open(str(filename)) as container:
+        assert container.streams[0].type == 'video'
+    # an error while closing does not replace the exception raised inside the with-block
+    class MyError(Exception):
+        pass
+    with pytest.raises(MyError), pytest.warns(UserWarning, match='closing'):
+        with VideoWriter(tmp_path / 'masked.mp4') as writer:
+            writer.write(np.zeros((64, 96), np.uint8))
+            def failing_mux(packets):
+                raise RuntimeError('simulated flush error')
+            writer._mux_packets = failing_mux
+            raise MyError()
+    # the empty-file warning is shown for each file (its text names the file)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter('default')
+        for name in ['empty1.mp4', 'empty2.mp4']:
+            VideoWriter(tmp_path / name).close()
+    assert sum('no file was written' in str(w.message) for w in caught) == 2
+
 def _audio_info(filename):
     import av
     with av.open(str(filename)) as container:

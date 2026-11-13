@@ -517,6 +517,21 @@ def warn_transcode(msg):
     warnings.warn('Consider transcoding (ffmpeg -y -i "input.mp4" -c:v libx264 -pix_fmt yuv420p -preset superfast -crf 23 "output.mp4").', stacklevel=2)
 
 
+def _fps_fraction(fps):
+    """ Frame rate as int or Fraction. Floats are converted to the simplest fraction that matches them closely
+    (e.g. 29.97 -> 2997/100, 30000/1001 -> 30000/1001). """
+    if isinstance(fps, (float, np.floating)):
+        if not np.isfinite(fps) or fps <= 0:
+            raise ValueError(f'fps must be a positive number, got {fps}.')
+        frac = Fraction(float(fps)).limit_denominator(1001)
+        if frac == 0 or abs(frac - fps) > 1e-6 * fps: # e.g. very low frame rates: use more precision
+            frac = Fraction(float(fps)).limit_denominator(10**6)
+        return frac
+    if fps <= 0:
+        raise ValueError(f'fps must be a positive number, got {fps}.')
+    return fps
+
+
 class _classproperty:
     def __init__(self, fget):
         self.fget = fget
@@ -544,11 +559,11 @@ class VideoWriter:
     """
 
     def __init__(self, filename, codec='libx264', fps=25, frame_shape=None, pix_fmt='yuv420p', audio_rate=None, audio_channels=1, **kwargs):
+        self.filename = filename
         self.container = av.open(filename, mode='w')
         self._closed = False
         self._n_muxed = 0
         self._pending = []  # packets held back until the video stream exists (streams cannot be added once muxing has started)
-        self._muxing = False
         self._next_pts = 0
         self.stream = None
         self.audio_stream = None
@@ -559,14 +574,14 @@ class VideoWriter:
             kwargs = {**dict(crf='23', preset='superfast'), **kwargs}
         try:
             self.codec = codec
-            self.fps = Fraction(fps).limit_denominator(1001) if isinstance(fps, float) else fps
+            self.fps = _fps_fraction(fps)
             self.pix_fmt = pix_fmt
             self.kwargs = {k: str(v) for k, v in kwargs.items() if v is not None} # codec options must be strings
-            if audio_rate is not None:
-                self._add_audio_stream(audio_rate, audio_channels)
             #add video stream, if frame_shape is provided (otherwise create when the first frame is written)
             if frame_shape is not None:
                 self._add_video_stream(frame_shape[0], frame_shape[1])
+            if audio_rate is not None:
+                self._add_audio_stream(audio_rate, audio_channels)
         except BaseException:
             self._closed = True
             self.container.close()
@@ -595,7 +610,7 @@ class VideoWriter:
     def _add_audio_stream(self, audio_rate, channels, stream_args=None):
         if channels not in (1, 2):
             raise ValueError(f'Only mono and stereo audio are supported, not {channels} channels.')
-        if self._muxing:
+        if self._n_muxed:
             raise ValueError('Cannot add an audio stream after video frames were written. Pass audio_rate (and '
                              'audio_channels) to VideoWriter() to write audio and video in any order.')
         self.channel_layout = 'mono' if channels == 1 else 'stereo'
@@ -611,7 +626,6 @@ class VideoWriter:
             self._pending.extend(packets)
             return
         for packet in packets:
-            self._muxing = True
             self.container.mux(packet)
             self._n_muxed += 1
 
@@ -703,7 +717,7 @@ class VideoWriter:
                 self._n_muxed += 1
             self._pending = []
             if self._n_muxed == 0 and not getattr(self, '_exiting_on_error', False):
-                warnings.warn('VideoWriter closed without any frames: no file was written.', stacklevel=2)
+                warnings.warn(f'{self.filename}: VideoWriter closed without any frames, no file was written.', stacklevel=2)
         finally:
             self.container.close()
 
@@ -718,7 +732,13 @@ class VideoWriter:
     
     def __exit__(self, exc_type, exc_value, traceback):
         self._exiting_on_error = exc_type is not None
-        self.close()
+        if exc_type is None:
+            self.close()
+            return False
+        try: # exiting with an exception: do not replace it with an error from closing the file
+            self.close()
+        except Exception as e:
+            warnings.warn(f'{self.filename}: error while closing the video after an exception: {e!r}', stacklevel=2)
         return False
     
     @_classproperty

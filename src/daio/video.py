@@ -3,6 +3,7 @@ import warnings
 
 import numpy as np
 import av
+from fractions import Fraction
 
 warnings.simplefilter("once")
 
@@ -517,43 +518,97 @@ def warn_transcode(msg):
     warnings.warn('Consider transcoding (ffmpeg -y -i "input.mp4" -c:v libx264 -pix_fmt yuv420p -preset superfast -crf 23 "output.mp4").', stacklevel=2)
 
 
+class _classproperty:
+    def __init__(self, fget):
+        self.fget = fget
+
+    def __get__(self, obj, cls):
+        return self.fget(cls)
+
+
 class VideoWriter:
-    ''' A class to write video files, using PyAV.
+    """ A class to write video files, using PyAV.
     
     Args:
         filename (str): path to the output video file
         codec (str): codec to use. Default is 'libx264'. Other options include 'h264', etc. Check VideoWriter.codecs_available for a list of available codecs.
-        fps (int): frames per second. Default is 25.
+        fps (int, float or Fraction): frames per second. Default is 25. Floats are converted to fractions (e.g. 29.97 -> 2997/100).
         frame_shape (tuple): shape of the frames. Default is None (to be determined by the first frame written).
+        pix_fmt (str): pixel format of the encoded video. Default is 'yuv420p' (frame height and width must be even).
+        audio_rate (int): sample rate of an audio stream to write with `write_audio`. Default is None (the audio stream
+            is created by the first call to `write_audio`, which must then come before the first video frame is
+            written, unless frame_shape is None).
+        audio_channels (int): number of audio channels (1 or 2) if audio_rate is given. Default is 1.
         **kwargs: additional keyword arguments to pass to the codec. Check e.g. `ffmpeg -h encoder=libx264`
-    '''
+    """
 
-    def __init__(self, filename, codec='libx264', fps=25, frame_shape=None, pix_fmt='yuv420p', **kwargs):
+    def __init__(self, filename, codec='libx264', fps=25, frame_shape=None, pix_fmt='yuv420p', audio_rate=None, audio_channels=1, **kwargs):
         self.container = av.open(filename, mode='w')
+        self._closed = False
+        self._pending = []  # packets held back until the video stream exists (streams cannot be added once muxing has started)
+        self._muxing = False
+        self._next_pts = 0
+        self.stream = None
         self.audio_stream = None
         #define codec defaults:
         if codec == 'h264':
-            #kwargs = dict(bit_rate=1000000, pix_fmt='yuv420p').update(kwargs)
             kwargs = {**dict(bit_rate='1000000'), **kwargs}
         elif codec == 'libx264':
-            #kwargs = dict(crf=23, preset='superfast', pix_fmt='yuv420p').update(kwargs)
             kwargs = {**dict(crf='23', preset='superfast'), **kwargs}
-        #add video stream, if frame_shape is provided (otherwise create when the first frame is written)
-        if frame_shape is not None:
-            self.stream = self.container.add_stream(codec, rate=fps, height=frame_shape[0], width=frame_shape[1], pix_fmt=pix_fmt, options=kwargs)
-        else:
-            self.stream = None
-            self.codec = codec
-            self.fps = fps
-            self.pix_fmt = pix_fmt
-            self.kwargs = kwargs if kwargs is not None else {}
+        self.codec = codec
+        self.fps = Fraction(fps).limit_denominator(1001) if isinstance(fps, float) else fps
+        self.pix_fmt = pix_fmt
+        self.kwargs = {k: str(v) for k, v in kwargs.items()} # codec options must be strings
+        try:
+            if audio_rate is not None:
+                self._add_audio_stream(audio_rate, audio_channels)
+            #add video stream, if frame_shape is provided (otherwise create when the first frame is written)
+            if frame_shape is not None:
+                self._add_video_stream(frame_shape[0], frame_shape[1])
+        except BaseException:
+            self._closed = True
+            self.container.close()
+            raise
+
+    def _add_video_stream(self, height, width):
+        comps = av.VideoFormat(self.pix_fmt, 2, 2).components  # chroma subsampling: chroma planes are smaller than 2x2
+        if (width % 2 and min(c.width for c in comps) < 2) or (height % 2 and min(c.height for c in comps) < 2):
+            raise ValueError(f'Frame size {height}x{width} (height x width) is not supported with pix_fmt={self.pix_fmt!r}: '
+                             f'height and width must be even. Crop or pad the frames, or use e.g. pix_fmt="yuv444p".')
+        self.stream = self.container.add_stream(self.codec, rate=self.fps, height=height, width=width, pix_fmt=self.pix_fmt, options=self.kwargs)
+        self.frame_shape = (height, width)
+        self._mux_packets(self._pending)
+        self._pending = []
+
+    def _add_audio_stream(self, audio_rate, channels, stream_args=None):
+        if channels not in (1, 2):
+            raise ValueError(f'Only mono and stereo audio are supported, not {channels} channels.')
+        if self._muxing:
+            raise ValueError('Cannot add an audio stream after video frames were written. Pass audio_rate (and '
+                             'audio_channels) to VideoWriter() to write audio and video in any order.')
+        self.channel_layout = 'mono' if channels == 1 else 'stereo'
+        if stream_args is None:
+            stream_args = dict(codec_name='aac', rate=44100, layout=self.channel_layout)
+        self.audio_stream = self.container.add_stream(**stream_args)
+        self.audio_rate = audio_rate
+        self.audio_channels = channels
+        self.audio_pts = 0
+
+    def _mux_packets(self, packets):
+        if self.stream is None: # the video stream may still be added: hold back packets
+            self._pending.extend(packets)
+            return
+        for packet in packets:
+            self._muxing = True
+            self.container.mux(packet)
 
     def write(self, im, pts=None):
         """ Write a frame to the video file
         
         Args:
-            im (np.ndarray): frame to write
-            pts (int): presentation timestamp of the frame. Default is None (don't use unles you know what you are doing)
+            im (np.ndarray): frame to write (uint8; shape (height, width) for grayscale or (height, width, 3) for RGB)
+            pts (int): presentation timestamp of the frame, in units of 1/fps. Must increase from frame to frame.
+                Default is None (the frame after the previous one; don't use unless you know what you are doing)
         """
         if im.ndim == 2:
             format = 'gray'
@@ -562,59 +617,81 @@ class VideoWriter:
         else:
             raise ValueError(f"Unsupported frame shape: {im.shape}")
         if self.stream is None:
-            self.stream = self.container.add_stream(self.codec, rate=self.fps, height=im.shape[0], width=im.shape[1], pix_fmt=self.pix_fmt, options=self.kwargs)
+            self._add_video_stream(im.shape[0], im.shape[1])
+        elif im.shape[:2] != self.frame_shape:
+            raise ValueError(f'Frame shape {im.shape[:2]} differs from the video frame shape {self.frame_shape}.')
+        if pts is None:
+            pts = self._next_pts
+        elif int(pts) < self._next_pts:
+            raise ValueError(f'pts must increase from frame to frame: got {pts} after {self._next_pts - 1}.')
         out_frame = av.VideoFrame.from_ndarray(im, format=format)
-        if pts is not None:
-            out_frame.pts = pts
-        for packet in self.stream.encode(out_frame):
-            self.container.mux(packet)
+        out_frame.pts = int(pts)
+        self._mux_packets(self.stream.encode(out_frame))
+        self._next_pts = int(pts) + 1
 
     def write_frames(self, frames):
         for frame in frames:
             self.write(frame)
 
-    def write_audio(self, audio_chunk, audio_rate, pts=None, stream_args=None):
+    def write_audio(self, audio_chunk, audio_rate=None, pts=None, stream_args=None):
         """ Write an audio chunk to the video file
 
         Args:
-            audio_chunk (np.ndarray): audio chunk to write
-            audio_rate (int): audio sample rate
-            pts (int): presentation timestamp of the audio chunk. Default is None (auto-increment)
-            stream_args (dict): additional arguments to pass to the audio stream.
+            audio_chunk (np.ndarray): audio chunk to write, with shape (channels, samples) or (samples,) for mono.
+                dtype int16, or float32/float64 in the range [-1, 1].
+            audio_rate (int): audio sample rate. Default is None (the audio_rate passed to VideoWriter())
+            pts (int): presentation timestamp of the audio chunk, in samples. Default is None (auto-increment)
+            stream_args (dict): additional arguments to pass to the audio stream (if it is created by this call).
         """
-        if stream_args is None:
-            stream_args = dict(codec_name='aac', rate=44100)
+        audio_chunk = np.asarray(audio_chunk)
+        if audio_chunk.ndim == 1:
+            audio_chunk = audio_chunk[None]
+        if audio_chunk.ndim != 2:
+            raise ValueError(f'audio_chunk must have shape (channels, samples), got {audio_chunk.shape}.')
         if self.audio_stream is None:
-            self.audio_stream = self.container.add_stream(**stream_args)
-            self.channel_layout = 'stereo' if (audio_chunk.ndim > 1 and audio_chunk.shape[0] == 2) else 'mono'
-            self.audio_pts = 0
-        audio_frame = av.AudioFrame.from_ndarray(audio_chunk, layout=self.channel_layout)
-        audio_frame.sample_rate = audio_rate
+            if audio_rate is None:
+                raise ValueError('audio_rate is required.')
+            self._add_audio_stream(audio_rate, audio_chunk.shape[0], stream_args)
+        if audio_chunk.shape[0] != self.audio_channels:
+            raise ValueError(f'audio_chunk has {audio_chunk.shape[0]} channels, but the audio stream has {self.audio_channels}. '
+                             f'Use shape (channels, samples).')
+        if audio_chunk.dtype == np.int16:
+            sample_format = 's16p'
+        elif audio_chunk.dtype.kind == 'f':
+            audio_chunk, sample_format = audio_chunk.astype(np.float32), 'fltp'
+        else:
+            raise ValueError(f'audio_chunk must be int16 or float, not {audio_chunk.dtype}.')
+        audio_frame = av.AudioFrame.from_ndarray(np.ascontiguousarray(audio_chunk), format=sample_format, layout=self.channel_layout)
+        audio_frame.sample_rate = self.audio_rate if audio_rate is None else audio_rate
         audio_frame.pts = self.audio_pts if pts is None else pts
         self.audio_pts = audio_frame.pts + audio_chunk.shape[1]
-        for packet in self.audio_stream.encode(audio_frame):
-            self.container.mux(packet)
+        self._mux_packets(self.audio_stream.encode(audio_frame))
 
     def close(self):
         """ Close the video file. """
         if not hasattr(self, 'container'): # __init__ failed before the file was opened
             return
+        if getattr(self, '_closed', True):
+            return
+        self._closed = True
         try:
-            for packet in self.stream.encode():
+            for stream in (self.stream, self.audio_stream):
+                # flush the encoder (not if it could not be opened, e.g. after an unsupported frame size: PyAV crashes)
+                if stream is not None and stream.codec_context.is_open:
+                    self._mux_packets(stream.encode())
+            for packet in self._pending: # audio only: packets held back for a video stream that was never added
                 self.container.mux(packet)
-        except:
-            pass
-        
-        try: 
-            for packet in self.audio_stream.encode():
-                self.container.mux(packet)
-        except:
-            pass
-
-        self.container.close()
+            self._pending = []
+            if self.stream is None and self.audio_stream is None:
+                warnings.warn('VideoWriter closed without frames: no file was written.', stacklevel=2)
+        finally:
+            self.container.close()
 
     def __del__(self):
-        self.close()
+        try:
+            self.close()
+        except Exception: # errors cannot be raised from __del__; call close() (or use a with statement) to see them
+            pass
             
     def __enter__(self):
         return self
@@ -623,7 +700,7 @@ class VideoWriter:
         self.close()
         return False
     
-    @property
-    def codecs_available(self):
-        ''' Return a list of available codecs. '''
+    @_classproperty
+    def codecs_available(cls):
+        """ Return a list of available codecs. """
         return sorted(av.codec.codecs_available)

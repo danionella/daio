@@ -66,6 +66,18 @@ def test_video_cfr_uses_nominal_rate(tmp_path):
         for i in [30, 10, 49, 11, 12, 0, 25]:
             assert np.array_equal(reader[i], sequential[i])
 
+def test_video_scan_notice(tmp_path, capsys, monkeypatch):
+    """ A one-line notice is printed when a large file is scanned to build a frame index. """
+    import daio.video
+    filename = tmp_path / 'test_video_gaps.mkv'
+    _write_video_with_gaps(filename)
+    VideoReader(filename, index='scan')
+    assert capsys.readouterr().out == '' # small file: no notice
+    monkeypatch.setattr(daio.video, 'SCAN_NOTICE_BYTES', 0)
+    VideoReader(filename, index='scan')
+    out = capsys.readouterr().out
+    assert out.count('\n') == 1 and 'test_video_gaps.mkv' in out and 'GB' in out
+
 def test_video_failed_init_no_spurious_del_error(tmp_path):
     """ If opening fails, the original exception is raised and __del__ does not raise a second error. """
     import gc, sys

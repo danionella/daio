@@ -1,9 +1,12 @@
+import os
 import warnings
 
 import numpy as np
 import av
 
 warnings.simplefilter("once")
+
+SCAN_NOTICE_BYTES = 1e9  # print a notice when scanning files larger than this to build a frame index
 
 class VideoReader:
     ''' A class to read video files quickly, using PyAV. It allows for fast seeking and reading of frames.
@@ -31,6 +34,7 @@ class VideoReader:
     def __init__(self, filename, format='gray', threading=True, thread_count=0, tolerance=0.1, index='auto'):
         if index not in ('auto', 'scan', 'nominal'):
             raise ValueError(f"index must be 'auto', 'scan' or 'nominal', not {index!r}")
+        self.filename = filename
         self.container = av.open(filename)
         self.stream = self.container.streams.video[0]
         self.stream.codec_context.thread_count = thread_count
@@ -99,6 +103,12 @@ class VideoReader:
 
     def build_index(self):
         ''' Scan all packets (without decoding) to build an exact map from frame index to presentation time stamp. '''
+        try:
+            size = os.path.getsize(self.filename)
+        except (TypeError, OSError): # e.g. file-like object or URL
+            size = 0
+        if size > SCAN_NOTICE_BYTES:
+            print(f'daio: scanning {os.path.basename(self.filename)} ({size / 1e9:.1f} GB) to build a frame index...', flush=True)
         self.container.seek(0)
         pts, kf_pts, kf_seek = [], [], []
         for packet in self.container.demux(self.stream):

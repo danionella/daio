@@ -43,6 +43,7 @@ class VideoReader:
         self.filename = filename
         self._threading, self._thread_count = threading, thread_count
         self._open()
+        self._rewind_reopens = not self._seek_reaches_start()
         self.read_format = format
         self.index_mode = index
         self._start_time = self.stream.start_time or 0
@@ -75,6 +76,22 @@ class VideoReader:
         self.stream.codec_context.thread_count = self._thread_count
         self.stream.codec_context.thread_type = 'AUTO' if self._threading else 'SLICE' # FRAME/AUTO/SLICE
         self.stream.codec_context.flags |= av.codec.context.Flags.copy_opaque # decoded frames carry their packet's file position
+
+    def _first_packet_pos(self):
+        packet = next((p for p in self.container.demux(self.stream) if p.size), None)
+        return None if packet is None else packet.pos
+
+    def _seek_reaches_start(self):
+        ''' Whether seeking to 0 returns to the first packet in the file (not the case e.g. for files whose first
+        frames have negative or no time stamps; the file is then re-opened to rewind). '''
+        first = self._first_packet_pos()
+        try:
+            self.container.seek(0)
+            ok = self._first_packet_pos() == first
+        except av.FFmpegError:
+            ok = False
+        self._open()
+        return ok
 
     def _container_index(self):
         ''' Read the container index (no file scan). Returns (timestamps, is_keyframe, is_discard, pos) arrays, or None if the
@@ -177,8 +194,6 @@ class VideoReader:
                 continue
             n_corrupt += packet.is_corrupt
             ts = packet.pts if packet.pts is not None else packet.dts
-            if ts is None:
-                raise ValueError('Video packets have no time stamps. Cannot build a frame index. Consider transcoding (ffmpeg -y -i "input.mp4" -c:v libx264 -pix_fmt yuv420p -preset superfast -crf 23 "output.mp4").')
             pts.append(ts)
             pos.append(packet.pos)
             if packet.is_keyframe:
@@ -186,6 +201,13 @@ class VideoReader:
                 kf_seek.append(ts if packet.dts is None else min(ts, packet.dts))
         if n_corrupt:
             self._warn_damaged(f'{n_corrupt} damaged packet(s) found, e.g. a truncated recording')
+        if any(ts is None for ts in pts): # no frame index possible: count frames, decode sequentially
+            self._frame_pts = self._frame_pos = None
+            self._nframes_counted = len(pts)
+            self.index_source = 'scan'
+            self._set_unseekable('some frames have no time stamps')
+            self.rewind()
+            return
         self._set_index(pts, kf_pts, kf_seek, source='scan', frame_pos=pos)
         self._calibrate()
         self.rewind()
@@ -226,10 +248,13 @@ class VideoReader:
 
     def rewind(self):
         ''' Rewind the video to the beginning. '''
-        try:
-            self.container.seek(0)
-        except av.FFmpegError: # e.g. files that do not start with a key frame
+        if self._rewind_reopens:
             self._open()
+        else:
+            try:
+                self.container.seek(0)
+            except av.FFmpegError: # e.g. files that do not start with a key frame
+                self._open()
         self.framegenerator = self._decode()
         self.last_pts = None
         self._next_idx = 0
@@ -322,9 +347,11 @@ class VideoReader:
             problem = None
             if frame_obj.pts is None:
                 problem = 'decoded frames have no time stamps'
-            elif seek_ts is not None and not frame_obj.key_frame and not (self._landing_packet and self._landing_packet[2]):
-                # (unless the seek landed on a key frame that an edit list discards)
-                problem = 'decoding after a seek does not start at a key frame (e.g. intra refresh)'
+            elif (seek_ts is not None and not frame_obj.key_frame and frame_obj.pict_type != av.video.frame.PictureType.I
+                  and not (self._landing_packet and self._landing_packet[2])): # (edit lists may discard the key frame)
+                if self._landing_packet and not self._landing_packet[1]:
+                    continue # the seek landed on a non-key frame (e.g. mpeg-ts): seek further back
+                problem = 'key frames in the file do not start a decodable picture (e.g. intra refresh)'
             elif frame_obj.pts > target_pts + wiggle: # overshoot (seek landed after the target)
                 continue
             while problem is None and frame_obj.pts < target_pts - wiggle:
@@ -477,6 +504,8 @@ class VideoReader:
         ''' Return the number of frames in the video. '''
         if self._frame_pts is not None:
             return len(self._frame_pts)
+        if getattr(self, '_nframes_counted', None) is not None:
+            return self._nframes_counted
         return self.stream.frames
 
     @property

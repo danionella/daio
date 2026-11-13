@@ -175,6 +175,16 @@ def test_video_truncated_file_warns(tmp_path):
             assert sum(1 for _ in reader) == len(reference)
     assert any('damaged' in str(w.message) for w in caught)
 
+def test_video_without_timestamps_is_read_sequentially(tmp_path):
+    """ Raw H.264 streams have no time stamps: no frame index is possible, but all frames are read correctly. """
+    filename = tmp_path / 'raw.h264'
+    with VideoWriter(filename, fps=25, g='12') as writer:
+        writer.write_frames(_ramp_frames(60))
+    _unreliable(filename)
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore')
+        assert VideoReader(filename).nframes == 60
+
 def test_video_slicing_and_iteration(tmp_path):
     filename = tmp_path / 'slicing.mp4'
     with VideoWriter(filename, fps=25, g='12') as writer:

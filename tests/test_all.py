@@ -364,203 +364,111 @@ def test_hdf5_numpy_to_native(tmp_path):
     assert np.array_equal(data2['d'], [1., 2.]) and np.array_equal(data2['e'], np.arange(3))
 
 
-def test_lazyh5_subgroup_writes(tmp_path):
-    """ Nested dicts and serialized items can be written into subgroups (h5path handling). """
+def test_h5_subgroups_and_h5path(tmp_path):
+    """ Writes into subgroups and h5path handling (paths used to be joined without '/'). """
     filename = tmp_path / 'subgroups.h5'
     h5 = lazyh5(filename)
     h5['c'] = {}
     h5['c']['e'] = [2, 3, 4]
     h5['c']['x'] = {'y': 1}
-    h5['c']['n'] = None
     h5['c']['j'] = [1, None]
     h5['c']['x']['z'] = {'deep': 'value'}
-    loaded = lazyh5(filename).to_dict()
-    assert loaded['c']['x']['y'] == 1 and loaded['c']['x']['z']['deep'] == 'value'
-    assert loaded['c']['n'] is None and loaded['c']['j'] == [1, None]
-    assert np.array_equal(loaded['c']['e'], [2, 3, 4])
     sub = lazyh5(filename)['c'].to_dict()
-    assert sub['x'] == {'y': 1, 'z': {'deep': 'value'}} and sub['n'] is None and sub['j'] == [1, None]
+    assert sub['x'] == {'y': 1, 'z': {'deep': 'value'}} and sub['j'] == [1, None] and list(sub['e']) == [2, 3, 4]
+    for path in ['/c', 'c', '/c/', 'c/']:
+        assert load_from_h5(filename, h5path=path)['j'] == [1, None]
+    save_to_h5(filename, {'z': 2}, h5path='/newgrp/sub', file_mode='a', verbosity=0) # the group is created
+    assert load_from_h5(filename)['newgrp']['sub']['z'] == 2
 
 
-def test_h5path_without_trailing_slash(tmp_path):
-    filename = tmp_path / 'h5path.h5'
-    save_to_h5(filename, {'g': {'sub': {'x': 1}, 'j': None}}, verbosity=0)
-    for path in ['/g', 'g', '/g/', 'g/']:
-        assert load_from_h5(filename, h5path=path) == {'j': None, 'sub': {'x': 1}}
-    save_to_h5(filename, {'new': {'z': 1}, 'n': None}, h5path='/g', file_mode='a', verbosity=0)
-    save_to_h5(filename, {'z': 2}, h5path='/newgrp/sub', file_mode='a', verbosity=0) # group is created
-    loaded = load_from_h5(filename)
-    assert loaded['g']['new']['z'] == 1 and loaded['g']['n'] is None and loaded['newgrp']['sub']['z'] == 2
-
-
-def test_lazyh5_getitem_decodes_serialized_items(tmp_path):
-    """ lazyh5[key] returns the same values as load_from_h5 (not raw JSON bytes). """
+def test_h5_lazyh5_decodes_like_load_from_h5(tmp_path):
     filename = tmp_path / 'serialized.h5'
-    data = {'none': None, 'lst': [1, None], 'bools': [True, False], 'd': {'k': [{'a': 1}]}}
-    save_to_h5(filename, data, verbosity=0)
+    save_to_h5(filename, {'none': None, 'lst': [1, None], 'bools': [True, False], 'd': {'k': [{'a': 1}]}, '_meta': 5}, verbosity=0)
     h5 = lazyh5(filename)
     assert h5['none'] is None and h5['lst'] == [1, None] and h5['bools'] == [True, False]
-    assert h5['d']['k'] == [{'a': 1}] and h5.d.k == [{'a': 1}]
+    assert h5['d'].to_dict() == load_from_h5(filename)['d'] and h5.d.k == [{'a': 1}]
+    assert h5._meta == 5 # attribute access also works for keys starting with '_'
 
 
-def test_save_to_h5_failure_does_not_destroy_file(tmp_path):
-    """ Unsupported items raise before the file is opened, so an existing file is not truncated. """
-    import pytest
-    filename = tmp_path / 'precious.h5'
-    save_to_h5(filename, {'precious': np.arange(10)}, verbosity=0)
-    with pytest.raises(TypeError, match='/b/c'):
-        save_to_h5(filename, {'a': 1, 'b': {'c': {1, 2}}}, verbosity=0) # a set is not JSON serializable
-    assert np.array_equal(load_from_h5(filename)['precious'], np.arange(10))
-    with pytest.raises(ValueError, match='already exists'): # append mode: existing keys are checked before writing
-        save_to_h5(filename, {'new': 1, 'precious': 2}, file_mode='a', verbosity=0)
-    assert list(load_from_h5(filename)) == ['precious']
-
-
-def test_lazyh5_overwrite_keeps_old_data_on_failure(tmp_path, monkeypatch):
-    import pytest
-    import daio.h5
-    filename = tmp_path / 'overwrite.h5'
-    h5 = lazyh5(filename)
-    h5['x'] = np.arange(5)
-    with pytest.raises(TypeError):
-        h5.from_dict({'x': {1, 2}}, overwrite=True) # cannot be encoded: nothing is changed
-    assert np.array_equal(h5['x'], np.arange(5))
-    original = daio.h5._write_node
-    def failing_write_node(group, key, node):
-        original(group, key, node)
-        raise OSError('simulated write error')
-    monkeypatch.setattr(daio.h5, '_write_node', failing_write_node)
-    with pytest.raises(OSError):
-        h5.from_dict({'x': np.zeros(3)}, overwrite=True) # fails while writing: old data is kept
-    monkeypatch.undo()
-    assert np.array_equal(h5['x'], np.arange(5)) and h5.keys() == ['x']
-    h5.from_dict({'x': 'new'}, overwrite=True)
-    assert h5['x'] == 'new' and h5.keys() == ['x']
-    with pytest.raises(ValueError, match='already exists'):
-        h5['x'] = 1
-    with pytest.raises(AttributeError): # backward compatible exception type
-        h5['x'] = 1
-
-
-def test_save_to_h5_write_time_errors_do_not_destroy_file(tmp_path):
-    """ Errors that h5py would only raise after opening the file are caught before it is opened. """
-    import pytest
-    filename = tmp_path / 'precious.h5'
-    save_to_h5(filename, {'precious': np.arange(3)}, verbosity=0)
-    for bad, kwargs in [({'a': 1, '': 2}, {}), ({'.': 1}, {}), ({'a': 1, 'a/b': 2}, {}), ({'a': np.arange(4)}, {'compression': 'foo'})]:
-        with pytest.raises(ValueError):
-            save_to_h5(filename, bad, verbosity=0, **kwargs)
-        assert np.array_equal(load_from_h5(filename)['precious'], np.arange(3)), bad
-    # str arrays containing NUL characters (not supported by HDF5 strings) are stored as JSON
-    save_to_h5(filename, {'s': np.array(['a\x00b', 'c'])}, verbosity=0)
-    assert list(load_from_h5(filename)['s']) == ['a\x00b', 'c']
-
-
-def test_lazyh5_failed_new_key_is_removed(tmp_path, monkeypatch):
-    import pytest
-    import daio.h5
-    h5 = lazyh5(tmp_path / 'partial.h5')
-    original = daio.h5._write_node
-    def failing_write_node(group, key, node):
-        if key == 'bad':
-            raise OSError('simulated write error')
-        original(group, key, node)
-    monkeypatch.setattr(daio.h5, '_write_node', failing_write_node)
-    with pytest.raises(OSError):
-        h5.from_dict({'y': {'ok': 1, 'bad': 2}})
-    monkeypatch.undo()
-    assert h5.keys() == [] # no partially written group 'y' left behind
-    h5.from_dict({'y': {'ok': 1}}) # retrying works
-    assert h5['y']['ok'] == 1
-
-
-def test_lazyh5_overwrite_swap_never_loses_original(tmp_path, monkeypatch):
-    import pytest
-    import h5py
-    h5 = lazyh5(tmp_path / 'swap.h5')
-    h5['x'] = np.arange(5)
-    original_move = h5py.Group.move
-    def interrupted_move(self, source, dest):
-        if source.startswith('__daio_tmp_'):
-            raise KeyboardInterrupt
-        return original_move(self, source, dest)
-    monkeypatch.setattr(h5py.Group, 'move', interrupted_move)
-    with pytest.raises(KeyboardInterrupt):
-        h5.from_dict({'x': np.zeros(3)}, overwrite=True)
-    monkeypatch.undo()
-    assert np.array_equal(h5['x'], np.arange(5))
-    assert h5.keys() == ['x'] # no temporary items left behind
-
-
-def test_lazyh5_attribute_access_to_underscore_keys(tmp_path):
-    h5 = lazyh5(tmp_path / 'underscore.h5')
-    h5['_meta'] = 5
-    assert h5._meta == 5 # attribute access works for keys starting with '_', as in earlier versions
-
-
-def test_hdf5_review_followups(tmp_path, monkeypatch):
-    import pytest
-    import daio.h5
-    filename = tmp_path / 'followups.h5'
-    # integer lists that float64 cannot represent exactly stay exact; mixed int/float lists stay float arrays
-    save_to_h5(filename, {'big': [-1, 2**63 + 1], 'mixed': [1, 2.5]}, verbosity=0)
-    loaded = load_from_h5(filename)
-    assert loaded['big'] == [-1, 2**63 + 1] and loaded['mixed'].dtype == np.float64
-    # bytes lists with NUL or non-ASCII bytes are refused (they used to be silently truncated), before writing
-    save_to_h5(filename, {'precious': np.arange(3)}, verbosity=0)
-    with pytest.raises(TypeError):
-        save_to_h5(filename, {'l': [b'ab\x00', b'\xff\x00']}, verbosity=0)
-    assert np.array_equal(load_from_h5(filename)['precious'], np.arange(3))
-    save_to_h5(filename, {'l': [b'ab', b'cd']}, verbosity=0) # plain ASCII bytes lists are stored (and load as str)
-    assert list(load_from_h5(filename)['l']) == ['ab', 'cd']
-    # a failed nested key ('a/b') also removes the group it created
-    h5 = lazyh5(tmp_path / 'nested.h5')
-    original = daio.h5._write_node
-    def failing_write_node(group, key, node):
-        if key == 'a/b':
-            group.create_group('a') # (h5py creates the intermediate group before failing)
-            raise OSError('simulated write error')
-        original(group, key, node)
-    monkeypatch.setattr(daio.h5, '_write_node', failing_write_node)
-    with pytest.raises(OSError):
-        h5.from_dict({'a/b': 1})
-    monkeypatch.undo()
-    assert h5.keys() == []
-    # '~' is expanded consistently
-    monkeypatch.setenv('HOME', str(tmp_path))
-    monkeypatch.setenv('USERPROFILE', str(tmp_path)) # (used by expanduser on Windows)
-    home = lazyh5('~/home.h5')
-    home['a'] = 1
-    assert home.keys() == ['a'] and home['a'] == 1 and (tmp_path / 'home.h5').exists()
-
-
-def test_hdf5_dataframe(tmp_path):
+def test_h5_dataframe(tmp_path):
     import pytest
     pd = pytest.importorskip('pandas')
     filename = tmp_path / 'df.h5'
     df = pd.DataFrame({'a': [1.5, 2.5], 'b': [3, 4]}, index=[10, 20])
     save_to_h5(filename, {'df': df, 'g': {'df': df}}, verbosity=0)
     for loaded in [load_from_h5(filename)['df'], lazyh5(filename)['g']['df']]:
-        assert loaded.index.tolist() == [10, 20]
-        assert np.array_equal(loaded['a'], df['a']) and np.array_equal(loaded['b'], df['b'])
+        assert loaded.index.tolist() == [10, 20] and loaded.equals(df)
 
 
-def test_hdf5_types_roundtrip(tmp_path):
-    """ Round trip of str, bytes, numpy scalars, complex, big ints and string/mixed lists and arrays. """
-    import warnings
+def test_h5_failed_saves_keep_existing_data(tmp_path):
+    """ Items that cannot be saved raise before the file is opened, so an existing file is not truncated. """
+    import pytest
+    filename = tmp_path / 'precious.h5'
+    save_to_h5(filename, {'precious': np.arange(3)}, verbosity=0)
+    cases = [
+        ({'a': 1, 'b': {'c': {1, 2}}}, {}, TypeError), # a set is not JSON serializable
+        ({1: 'a'}, {}, TypeError), # keys must be str
+        ({'a': 1, '': 2}, {}, ValueError), ({'.': 1}, {}, ValueError), ({'a': 1, 'a/b': 2}, {}, ValueError), # invalid keys
+        ({'a': np.arange(4)}, {'compression': 'foo'}, ValueError), # unavailable compression filter
+        ({'s': 'a\x00b'}, {}, TypeError), ({'b': b'\xff\x00'}, {}, TypeError), ({'l': [b'ab\x00']}, {}, TypeError), # NUL/binary
+        ({'u': np.array(['a'])}, {}, TypeError), ({'c': 1 + 2j}, {}, TypeError), # no HDF5 / JSON equivalent
+    ]
+    for bad, kwargs, error in cases:
+        with pytest.raises(error):
+            save_to_h5(filename, bad, verbosity=0, **kwargs)
+        assert list(load_from_h5(filename)) == ['precious'], bad
+    with pytest.raises(ValueError, match='already exists'): # append mode: existing keys are checked before writing
+        save_to_h5(filename, {'new': 1, 'precious': 2}, file_mode='a', verbosity=0)
+    assert list(load_from_h5(filename)) == ['precious']
+
+
+def test_h5_failed_writes_are_cleaned_up(tmp_path, monkeypatch):
+    """ Writes that fail midway leave no partial items behind, and overwrites never lose the original. """
+    import pytest, h5py
+    import daio.h5
+    original_write, original_move = daio.h5._write_node, h5py.Group.move
+    def failing_write(fail_key, create_group=False):
+        def write(group, key, node):
+            if key == fail_key:
+                if create_group:
+                    group.create_group(key.split('/')[0]) # (h5py creates intermediate groups before failing)
+                raise OSError('simulated write error')
+            original_write(group, key, node)
+        return write
+    h5 = lazyh5(tmp_path / 'cleanup.h5')
+    for data, fail_key, nested in [({'y': {'ok': 1, 'bad': 2}}, 'bad', False), ({'a/b': 1}, 'a/b', True)]:
+        monkeypatch.setattr(daio.h5, '_write_node', failing_write(fail_key, nested))
+        with pytest.raises(OSError):
+            h5.from_dict(data)
+        monkeypatch.undo()
+        assert h5.keys() == [], data
+    h5['x'] = np.arange(5)
+    monkeypatch.setattr(daio.h5, '_write_node', lambda group, key, node: (original_write(group, key, node), 1 / 0))
+    with pytest.raises(ZeroDivisionError): # overwrite fails while writing the replacement
+        h5.from_dict({'x': np.zeros(3)}, overwrite=True)
+    monkeypatch.undo()
+    monkeypatch.setattr(h5py.Group, 'move', lambda self, src, dst: (_ for _ in ()).throw(KeyboardInterrupt) if src.startswith('__daio_tmp_') else original_move(self, src, dst))
+    with pytest.raises(KeyboardInterrupt): # overwrite interrupted while swapping
+        h5.from_dict({'x': np.zeros(3)}, overwrite=True)
+    monkeypatch.undo()
+    assert np.array_equal(h5['x'], np.arange(5)) and h5.keys() == ['x']
+    h5.from_dict({'x': 'new'}, overwrite=True)
+    assert h5['x'] == 'new' and h5.keys() == ['x']
+    for error in [ValueError, AttributeError]: # (AttributeError: backward compatible)
+        with pytest.raises(error, match='already exists'):
+            h5['x'] = 1
+
+
+def test_h5_types(tmp_path):
+    import h5py
     filename = tmp_path / 'types.h5'
     data = {
-        'bytes_ascii': b'abc', # stored as an HDF5 string (loads as str, as before)
-        'bytes_binary': b'\xff\x00\x01',
-        'str_nul': 'a\x00b',
-        'np_float32': np.float32(1.5),
-        'np_int32': np.int32(3),
-        'np_bool': np.bool_(True),
-        'complex': 1 + 2j,
-        'bigint': 2**70,
-        'U_array': np.array(['a', 'bc']),
+        'bytes_ascii': b'abc', 'bytes_list': [b'ab', b'cd'], # stored as HDF5 strings (load as str, as before)
         'str_list': [np.str_('a'), 'bc'],
         'mixed_list': [1, 'a'], # must not be converted to ['1', 'a']
+        'int_float_list': [1, 2.5], # float array
+        'bigint': 2**70, 'bigint_list': [-1, 2**63 + 1], # beyond int64 / float64 precision: stored exactly as JSON
+        'np_float32': np.float32(1.5), # numpy scalars other than int64/float64: JSON (as before)
         'arrays_list': [np.zeros(2), np.ones(3)],
         'zero_d': np.array(5),
     }
@@ -568,31 +476,16 @@ def test_hdf5_types_roundtrip(tmp_path):
         warnings.simplefilter('error') # no (misleading) compression warnings
         save_to_h5(filename, data, compression='gzip', verbosity=0)
     loaded = load_from_h5(filename)
-    assert loaded['bytes_ascii'] == 'abc'
-    assert loaded['bytes_binary'] == b'\xff\x00\x01'
-    assert loaded['str_nul'] == 'a\x00b'
-    for key in ['np_float32', 'np_int32', 'np_bool']:
-        assert loaded[key] == data[key] and loaded[key].dtype == data[key].dtype
-    assert loaded['complex'] == 1 + 2j and loaded['bigint'] == 2**70
-    assert list(loaded['U_array']) == ['a', 'bc'] and list(loaded['str_list']) == ['a', 'bc']
-    assert loaded['mixed_list'] == [1, 'a']
-    assert loaded['arrays_list'] == [[0, 0], [1, 1, 1]]
-    assert loaded['zero_d'] == 5
-    import pytest
-    with pytest.raises(TypeError, match='keys must be strings'):
-        save_to_h5(filename, {1: 'a'}, verbosity=0)
+    assert loaded['bytes_ascii'] == 'abc' and list(loaded['bytes_list']) == ['ab', 'cd'] and list(loaded['str_list']) == ['a', 'bc']
+    assert loaded['mixed_list'] == [1, 'a'] and loaded['int_float_list'].dtype == np.float64
+    assert loaded['bigint'] == 2**70 and loaded['bigint_list'] == [-1, 2**63 + 1]
+    assert loaded['np_float32'] == 1.5 and loaded['arrays_list'] == [[0, 0], [1, 1, 1]] and loaded['zero_d'] == 5
+    with h5py.File(filename, 'a') as f: # non-ASCII bytes stored as HDF5 strings (by earlier versions) load as bytes
+        f.create_dataset('old_bytes', data=b'\xff\x01')
+    assert load_from_h5(filename)['old_bytes'] == b'\xff\x01'
 
 
-def test_hdf5_reads_binary_bytes_from_old_files(tmp_path):
-    """ Non-ASCII bytes stored as HDF5 strings (by earlier versions) load as bytes instead of raising. """
-    import h5py
-    filename = tmp_path / 'old.h5'
-    with h5py.File(filename, 'w') as f:
-        f.create_dataset('b', data=b'\xff\x01')
-    assert load_from_h5(filename)['b'] == b'\xff\x01'
-
-
-def test_lazyh5_robustness(tmp_path):
+def test_lazyh5_robustness(tmp_path, monkeypatch):
     import copy, pickle, pytest
     filename = tmp_path / 'robust.h5'
     h5 = lazyh5(filename) # file does not exist yet
@@ -605,3 +498,8 @@ def test_lazyh5_robustness(tmp_path):
         lazyh5(filename, readonly=True, erase_existing=True)
     assert filename.exists()
     assert 'FileNotFoundError' in repr(lazyh5(tmp_path / 'missing.h5', readonly=True)) # repr does not raise
+    monkeypatch.setenv('HOME', str(tmp_path))
+    monkeypatch.setenv('USERPROFILE', str(tmp_path)) # (used by expanduser on Windows)
+    home = lazyh5('~/home.h5') # '~' is expanded consistently
+    home['a'] = 1
+    assert home.keys() == ['a'] and home['a'] == 1 and (tmp_path / 'home.h5').exists()

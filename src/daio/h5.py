@@ -137,40 +137,29 @@ def _list_to_array(obj):
 
 
 def _native(item):
-    """ Return (data, dtype, attrs) for items stored as native HDF5 datasets, or None for items to be JSON serialized. """
+    """ Return (data, dtype) for items stored as native HDF5 datasets, or None for items to be JSON serialized.
+    Items that HDF5 cannot store raise TypeError (before the file is opened). """
     if isinstance(item, str):
         if '\x00' in item:
-            return None # HDF5 strings cannot hold NUL characters
-        return str(item), None, {}
+            raise TypeError('HDF5 strings cannot contain NUL characters')
+        return item, None
     if isinstance(item, bytes):
         if b'\x00' in item or not item.isascii():
-            # binary data: store as opaque bytes (HDF5 strings cannot hold NUL characters or non-text bytes)
-            return np.void(bytes(item)), None, {'bytes_type': 'Raw bytes stored as an opaque HDF5 scalar.'}
-        return bytes(item), None, {}
-    if isinstance(item, bool):
-        return item, None, {}
-    if isinstance(item, int):
-        if -2**63 <= item < 2**64:
-            return item, None, {}
-        return None # out of HDF5 integer range
-    if isinstance(item, (float, complex)):
-        return item, None, {}
-    if isinstance(item, np.generic):
-        if item.dtype.kind in 'biufc' and _h5_supports_dtype(item.dtype):
-            return item, None, {}
-        return None
+            raise TypeError('only ASCII bytes without NUL characters can be saved')
+        return item, None
+    if isinstance(item, int) and not -2**63 <= item < 2**64:
+        return None # out of HDF5 integer range: JSON
+    if isinstance(item, (int, float, np.int64, np.float64)):
+        return item, None
     if isinstance(item, np.ndarray):
-        if item.dtype.kind in 'UO':
-            as_obj = item.astype(object)
-            if _all_str(as_obj): # (str without NUL characters)
-                return as_obj, h5py.string_dtype(), {}
-            return None
-        return item, None, {}
+        if not _h5_supports_dtype(item.dtype):
+            raise TypeError(f'arrays of dtype {item.dtype} cannot be saved')
+        return item, None
     if isinstance(item, (list, tuple)):
         arr = _list_to_array(item)
         if arr is None:
             return None
-        return arr, (h5py.string_dtype() if arr.dtype.kind == 'O' else None), {}
+        return arr, (h5py.string_dtype() if arr.dtype.kind == 'O' else None)
     return None
 
 
@@ -201,13 +190,14 @@ def _prepare_item(item, path, opts):
         json_bytes = np.frombuffer(item.to_json().encode('utf-8'), dtype='byte')
         attrs = {'pandas_json_type': f'This {type(item)} was JSON serialized and UTF-8 encoded.'}
         return ('dataset', json_bytes, None, opts['json_compression'], attrs)
-    native = _native(item)
+    try:
+        native = _native(item)
+    except TypeError as e:
+        raise TypeError(f'Cannot save {type(item)} at {path}: {e}') from None
     if native is not None:
-        data, dtype, attrs = native
-        if dtype is None and isinstance(data, np.ndarray) and not _h5_supports_dtype(data.dtype):
-            raise TypeError(f'Cannot save array of dtype {data.dtype} at {path}: no HDF5 equivalent.')
+        data, dtype = native
         compression = None if np.ndim(data) == 0 else opts['compression']
-        return ('dataset', data, dtype, compression, attrs)
+        return ('dataset', data, dtype, compression, {})
     if not opts['serialize']:
         raise ValueError(f'Cannot save {type(item)} to {path}. Consider enabling serialisation.')
     if opts['verbosity'] > 0:
@@ -288,8 +278,6 @@ def _read_dataset(item):
     if 'json_type' in item.attrs:
         #TODO: test replacing json with orjson
         return json.loads(item[()].tobytes())
-    if 'bytes_type' in item.attrs:
-        return item[()].tobytes()
     if h5py.check_string_dtype(item.dtype) is not None:
         try:
             return item.asstr()[()]

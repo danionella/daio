@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=42", "wheel"]
+requires = ["setuptools>=77", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -9,11 +9,15 @@ description = "video and data IO tools for Python"
 authors = [
     { name = "jlab.berlin" },
 ]
-license = {text = "MIT"}
+license = "MIT"
+license-files = ["LICENSE"]
 readme = "README.md"
 keywords = ["python", "HDF5", "data IO", "video IO"]
 requires-python = ">=3.10"
-dependencies = ["numpy","av>=17","h5py","hdf5plugin"]
+dependencies = ["numpy","av>=17","h5py>=3","hdf5plugin"]
+
+[project.optional-dependencies]
+pandas = ["pandas"]
 
 [project.urls]
 Homepage = "https://github.com/danionella/daio"

@@ -24,6 +24,7 @@ Links: [API documentation](http://danionella.github.io/daio), [GitHub repository
 ## Installation
 - via conda or mamba: `conda install conda-forge::daio`
 - if you prefer pip: `pip install daio`
+- optional: pandas, to save and load DataFrames (`pip install "daio[pandas]"`)
 
 ## Use 
 

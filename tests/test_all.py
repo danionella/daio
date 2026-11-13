@@ -66,6 +66,26 @@ def test_video_cfr_uses_nominal_rate(tmp_path):
         for i in [30, 10, 49, 11, 12, 0, 25]:
             assert np.array_equal(reader[i], sequential[i])
 
+def test_video_failed_init_no_spurious_del_error(tmp_path):
+    """ If opening fails, the original exception is raised and __del__ does not raise a second error. """
+    import gc, sys
+    unraisable = []
+    old_hook = sys.unraisablehook
+    sys.unraisablehook = unraisable.append
+    try:
+        try:
+            VideoReader(tmp_path / 'nonexistent.mp4')
+        except FileNotFoundError:
+            pass
+        try:
+            VideoWriter(tmp_path / 'video.notaformat')
+        except ValueError:
+            pass
+        gc.collect()
+    finally:
+        sys.unraisablehook = old_hook
+    assert unraisable == [], [str(u.exc_value) for u in unraisable]
+
 def test_hdf5(tmp_path):
     data = {
         'a': 1,

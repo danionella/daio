@@ -216,6 +216,8 @@ class VideoReader:
         return frame
 
     def close(self):
+        if not hasattr(self, 'container'): # __init__ failed before the file was opened
+            return
         self.container.close()
         
     def __del__(self):
@@ -384,6 +386,8 @@ class VideoWriter:
 
     def close(self):
         """ Close the video file. """
+        if not hasattr(self, 'container'): # __init__ failed before the file was opened
+            return
         try:
             for packet in self.stream.encode():
                 self.container.mux(packet)

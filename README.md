@@ -49,7 +49,7 @@ for frame in reader:
 reader.close()
 ```
 
-Indexing is frame-accurate: `reader[i]` returns the same frame as the i-th frame read sequentially. For constant frame rate videos, frames are located using the nominal frame rate. For variable frame rate videos, videos with dropped frames or edit lists, or containers without a reliable frame count (e.g. mkv, avi, ts), `VideoReader` first scans all packet time stamps (fast, no decoding) to build an exact frame index. You can force this with `VideoReader(path, index='scan')`. Per-frame presentation times (in seconds) are available as `reader.frame_times`.
+Indexing is frame-accurate: `reader[i]` returns the same frame as the i-th frame read sequentially. Frames are located using the container index (mp4/mov without B-frames), or the nominal frame rate (constant frame rate mp4/mov with B-frames). In other cases (e.g. variable frame rate with B-frames, dropped frames, edit lists, or mkv/ts containers), `VideoReader` first scans all packet time stamps (no decoding, but reads the whole file) to build an exact frame index. You can force this with `VideoReader(path, index='scan')`; `reader.index_source` tells you which method is used. Per-frame presentation times (in seconds) are available as `reader.frame_times`.
 
 You can also use with statements to handle file closure:
 ```python

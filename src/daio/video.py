@@ -9,10 +9,14 @@ class VideoReader:
     ''' A class to read video files quickly, using PyAV. It allows for fast seeking and reading of frames.
 
     Frame index `i` always refers to the i-th frame in presentation order, i.e. `reader[i]` returns the same frame as
-    the i-th frame obtained by sequential reading. For constant frame rate videos, frame indices are mapped to time
-    stamps using the nominal frame rate. For variable frame rate videos (or videos with dropped frames, edit lists,
-    or containers without frame count), a frame index is built by scanning all packet time stamps once (demuxing
-    only, no decoding).
+    the i-th frame obtained by sequential reading. To map frame indices to time stamps, the reader uses (in order of
+    preference, see `index` argument):
+
+    1. the container index (e.g. mp4/mov sample table), if it is complete and the stream has no B-frames (frame
+       reordering). The container index holds decode time stamps, which then equal presentation time stamps.
+    2. the nominal frame rate, if the container index shows evenly spaced frames (constant frame rate).
+    3. a frame index built by scanning all packet time stamps once (demuxing only, no decoding). This reads the
+       whole file, and is needed e.g. for variable frame rate videos with B-frames, or mkv/ts containers.
 
     Args:
         filename (str): path to the video file
@@ -20,9 +24,8 @@ class VideoReader:
         threading (bool): enable threading in the decoder. Default is True.
         thread_count (int): number of threads to use for decoding. Default is 0 (auto).
         tolerance (float): tolerance for frame time stamp deviations (fraction of frame interval). Default is 0.1.
-        index (str): how to map frame indices to time stamps. 'auto' (default): use the nominal frame rate if the
-            container metadata indicates a constant frame rate, otherwise scan the file to build a frame index (also
-            done lazily if a seek lands on an unexpected time stamp). 'scan': always build a frame index.
+        index (str): how to map frame indices to time stamps. 'auto' (default): choose as described above (a file
+            scan is also done lazily if a seek lands on an unexpected time stamp). 'scan': always scan the file.
             'nominal': always use the nominal frame rate (legacy behaviour; not reliable for variable frame rates).
     '''
     def __init__(self, filename, format='gray', threading=True, thread_count=0, tolerance=0.1, index='auto'):
@@ -40,30 +43,59 @@ class VideoReader:
         self._frame_pts = None  # sorted presentation time stamps of all frames (None: use nominal frame rate)
         self._keyframe_pts = None  # presentation time stamps of key frames
         self._keyframe_seek_ts = None  # time stamps to seek to for each key frame
-        if index == 'scan' or (index == 'auto' and not self._looks_cfr()):
+        self.index_source = None  # where the frame index came from: None (nominal frame rate), 'container' or 'scan'
+        if index == 'scan':
             self.build_index()
+        elif index == 'auto':
+            self._auto_index()
         self.rewind()
         if index == 'nominal' and self.stream.average_rate != self.stream.guessed_rate:
             warn_transcode(f'Average frame rate ({self.stream.average_rate}) is different from nominal frame rate ({self.stream.guessed_rate}). Seeking may be unrealiable. Consider using index="auto" or "scan".')
 
-    def _looks_cfr(self):
-        ''' Cheap check (no file scan) whether frame indices can be mapped to time stamps using the nominal frame rate.
-
-        Requires a complete container index (e.g. mp4/mov sample tables) with evenly spaced time stamps, no discarded
-        samples (edit lists) and a frame count that matches the stream metadata.
-        '''
+    def _container_index(self):
+        ''' Read the container index (no file scan). Returns (timestamps, is_keyframe, is_discard) arrays, or None if the
+        index is not complete (e.g. mkv/ts, fragmented mp4, avi with frame count mismatch). Timestamps are decode time
+        stamps (dts) in units of stream.time_base. '''
         n = self.stream.frames
-        if not n or self.stream.average_rate != self.stream.guessed_rate:
-            return False
         entries = self.stream.index_entries
-        if len(entries) != n:
-            return False
+        if not n or len(entries) != n:
+            return None
         ts = np.empty(n, dtype=np.int64)
+        kf = np.empty(n, dtype=bool)
+        discard = np.empty(n, dtype=bool)
         for i, e in enumerate(entries):
-            if e.is_discard:
-                return False
-            ts[i] = e.timestamp
-        return bool(np.all(np.abs(np.diff(ts) - self._pts_per_frame) <= self.wiggle_pts))
+            ts[i], kf[i], discard[i] = e.timestamp, e.is_keyframe, e.is_discard
+        return ts, kf, discard
+
+    def _auto_index(self):
+        ''' Choose the cheapest reliable way to map frame indices to time stamps (see class docstring). '''
+        cidx = self._container_index()
+        if cidx is None:
+            return self.build_index()
+        ts, kf, discard = cidx
+        if self.stream.codec_context.has_b_frames == 0:
+            # no frame reordering: decode time stamps are presentation time stamps
+            keep = ~discard
+            self._set_index(ts[keep], ts[keep & kf], ts[keep & kf], source='container')
+            # calibrate a possible constant offset between container time stamps and decoded frame time stamps
+            self.rewind()
+            first = next(self.framegenerator, None)
+            offset = 0 if first is None or first.pts is None else first.pts - int(self._frame_pts[0])
+            if offset:
+                self._frame_pts += offset
+                self._keyframe_pts += offset
+            return
+        uniform = np.all(np.abs(np.diff(ts) - self._pts_per_frame) <= self.wiggle_pts)
+        if uniform and not discard.any() and self.stream.average_rate == self.stream.guessed_rate:
+            return # constant frame rate: use nominal frame rate
+        self.build_index()
+
+    def _set_index(self, frame_pts, kf_pts, kf_seek_ts, source):
+        self._frame_pts = np.sort(np.asarray(frame_pts, dtype=np.int64))
+        order = np.argsort(kf_pts, kind='stable')
+        self._keyframe_pts = np.asarray(kf_pts, dtype=np.int64)[order]
+        self._keyframe_seek_ts = np.asarray(kf_seek_ts, dtype=np.int64)[order]
+        self.index_source = source
 
     def build_index(self):
         ''' Scan all packets (without decoding) to build an exact map from frame index to presentation time stamp. '''
@@ -79,15 +111,12 @@ class VideoReader:
             if packet.is_keyframe:
                 kf_pts.append(ts)
                 kf_seek.append(ts if packet.dts is None else min(ts, packet.dts))
-        self._frame_pts = np.sort(np.array(pts, dtype=np.int64))
-        order = np.argsort(kf_pts, kind='stable')
-        self._keyframe_pts = np.array(kf_pts, dtype=np.int64)[order]
-        self._keyframe_seek_ts = np.array(kf_seek, dtype=np.int64)[order]
+        self._set_index(pts, kf_pts, kf_seek, source='scan')
         self.rewind()
 
     @property
     def has_index(self):
-        ''' Whether an exact frame index (built by scanning the file) is used. '''
+        ''' Whether an exact frame index (from the container index or a file scan) is used. '''
         return self._frame_pts is not None
 
     def _frame_to_pts(self, n):
@@ -176,7 +205,7 @@ class VideoReader:
         target_pts = self._frame_to_pts(frame_idx)
         frame_obj = self._seek_and_decode(frame_idx, target_pts)
         if np.abs(frame_obj.pts - target_pts) > (0 if self._frame_pts is not None else self.wiggle_pts):
-            if self.index_mode == 'auto' and self._frame_pts is None:
+            if self.index_mode == 'auto' and self.index_source != 'scan':
                 warnings.warn(f'Unexpected time stamp when seeking to frame {frame_idx} (pts: {frame_obj.pts}; expected: {target_pts}). Irregular frame timing detected; scanning file to build a frame index.', stacklevel=2)
                 self.build_index()
                 return self.read_frame(frame_idx)

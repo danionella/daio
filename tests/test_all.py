@@ -24,11 +24,11 @@ def test_video(tmp_path):
         for frame in reader:
             frame.mean()
 
-def _write_video_with_gaps(filename, container_ext):
+def _write_video_with_gaps(filename, **kwargs):
     """ Write a video with missing frames (irregular time stamps), as produced by cameras that drop frames. """
     n = 120
     pts = [i for i in range(n) if not (40 <= i < 45) and i % 17 != 0] # drop a block of frames and every 17th frame
-    with VideoWriter(filename, fps=25, gop_size='12') as writer:
+    with VideoWriter(filename, fps=25, gop_size='12', **kwargs) as writer:
         for p in pts:
             frame = np.full((64, 96), (p * 2) % 256, dtype='uint8') # brightness encodes the original frame number
             writer.write(frame, pts=p)
@@ -36,14 +36,19 @@ def _write_video_with_gaps(filename, container_ext):
 
 def test_video_irregular_timestamps(tmp_path):
     """ The i-th frame obtained by seeking must equal the i-th frame obtained by sequential reading. """
-    for ext in ['mp4', 'mkv']:
-        filename = tmp_path / f'test_video_gaps.{ext}'
-        pts = _write_video_with_gaps(filename, ext)
+    cases = [ # (extension, writer options, expected index source in 'auto' mode)
+        ('mp4', {}, 'scan'), # B-frames: container index holds decode time stamps only -> scan
+        ('mp4', {'bf': '0'}, 'container'), # no B-frames: container index suffices
+        ('mkv', {}, 'scan'), # no complete container index
+    ]
+    for ext, opts, auto_source in cases:
+        filename = tmp_path / f'test_video_gaps_{len(opts)}.{ext}'
+        pts = _write_video_with_gaps(filename, **opts)
         sequential = list(VideoReader(filename))
         assert len(sequential) == len(pts)
         for index in ['auto', 'scan']:
             with VideoReader(filename, index=index) as reader:
-                assert reader.has_index
+                assert reader.index_source == (auto_source if index == 'auto' else 'scan')
                 assert reader.nframes == len(pts)
                 assert len(reader.frame_times) == len(pts)
                 rng = np.random.default_rng(0)
@@ -57,7 +62,7 @@ def test_video_cfr_uses_nominal_rate(tmp_path):
             writer.write(np.full((64, 96), i * 4, dtype='uint8'))
     sequential = list(VideoReader(filename))
     with VideoReader(filename) as reader:
-        assert not reader.has_index # no file scan needed for constant frame rate mp4
+        assert reader.index_source is None # constant frame rate mp4 (with B-frames): nominal frame rate, no file scan
         for i in [30, 10, 49, 11, 12, 0, 25]:
             assert np.array_equal(reader[i], sequential[i])
 

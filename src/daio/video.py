@@ -53,6 +53,7 @@ class VideoReader:
         self._keyframe_pts = None  # presentation time stamps of key frames
         self._keyframe_seek_ts = None  # time stamps to seek to for each key frame
         self._frame_pos = None  # file position of each frame's packet (aligned with _frame_pts; -1: unknown)
+        self._nframes_counted = None  # frame count of files without frame index (counted packets)
         self.seekable = True  # False: seeking is unreliable for this file, frames are decoded sequentially
         self.index_source = None  # where the frame index came from: None (nominal frame rate), 'container' or 'scan'
         if index == 'scan':
@@ -121,9 +122,9 @@ class VideoReader:
         ts, kf, discard, pos = cidx
         # container index positions can differ from packet positions by a constant (e.g. avi chunk headers)
         self.rewind()
-        first_packet = next((p for p in self.container.demux(self.stream) if p.size), None)
-        if first_packet is not None and first_packet.pos is not None and first_packet.pos >= 0 and pos[0] >= 0:
-            pos = pos + (first_packet.pos - pos[0])
+        first_pos = self._first_packet_pos()
+        if first_pos is not None and first_pos >= 0 and pos[0] >= 0:
+            pos = pos + (first_pos - pos[0])
         if self.stream.codec_context.has_b_frames == 0:
             # no frame reordering: decode time stamps are presentation time stamps
             keep = ~discard
@@ -158,7 +159,7 @@ class VideoReader:
             return
         if self.index_source == 'container':
             ref = None
-            if first.opaque is not None and first.opaque[0] >= 0:
+            if first.opaque is not None and first.opaque[0] is not None and first.opaque[0] >= 0:
                 match = np.flatnonzero(self._frame_pos == first.opaque[0])
                 ref = self._frame_pts[match[0]] if len(match) else None
             if ref is None:
@@ -408,15 +409,18 @@ class VideoReader:
             raise IndexError('negative frame indices are not supported for videos with unknown frame count')
         try:
             return self._read_frame(frame_idx)
-        except StopIteration:
-            if self._frame_pts is None and getattr(self, '_nframes_counted', None) is not None and self._next_idx < self._nframes_counted:
+        except (StopIteration, IndexError) as e:
+            if self._frame_pts is None and self._nframes_counted is not None and self._next_idx < self._nframes_counted:
                 self._nframes_counted = self._next_idx # frame count without index: the video ended earlier
+            if isinstance(e, IndexError):
+                raise
             self.rewind()
             raise IndexError(f'frame index {frame_idx} out of range') from None
 
     def _read_frame(self, frame_idx):
         if frame_idx == 0:
-            self.rewind()
+            if self._next_idx != 0: # (at the start after rewind(): no need to rewind again)
+                self.rewind()
             return self.read()
         if frame_idx == self._next_idx:
             return self.read()
@@ -496,11 +500,12 @@ class VideoReader:
         ''' Iterate over all frames. Each loop keeps its own position, so nested loops or zip(reader, reader) work. '''
         i = 0
         while not self.nframes or i < self.nframes:
+            expected = self.nframes
             try:
                 frame = self.read_frame(i)
             except IndexError:
-                if self.nframes: # end of video reached early (e.g. damaged file)
-                    warnings.warn(f'{self.filename}: video ended after {i} frames, expected {self.nframes}.', stacklevel=2)
+                if expected: # end of video reached early (e.g. damaged file)
+                    warnings.warn(f'{self.filename}: video ended after {i} frames, expected {expected}.', stacklevel=2)
                 return
             yield frame
             i += 1
@@ -519,7 +524,7 @@ class VideoReader:
         ''' Return the number of frames in the video. '''
         if self._frame_pts is not None:
             return len(self._frame_pts)
-        if getattr(self, '_nframes_counted', None) is not None:
+        if self._nframes_counted is not None:
             return self._nframes_counted
         return self.stream.frames
 

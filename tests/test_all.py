@@ -247,6 +247,26 @@ def test_video_raw_streams(tmp_path):
                 assert reader.nframes == len(reference), filename.name
                 _check_random_access(reader, reference, n_random=10)
 
+def test_video_frame_count_corrected_when_video_ends_early(tmp_path):
+    """ Without a frame index, frames are counted from packets; if fewer frames decode, the count is corrected. """
+    filename = tmp_path / 'raw.h264'
+    with VideoWriter(filename, fps=25, g='12') as writer:
+        writer.write_frames(_ramp_frames(60))
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore')
+        reader = VideoReader(filename)
+    reader._nframes_counted += 5 # simulate packets that do not decode (e.g. damaged)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter('always')
+        assert sum(1 for _ in reader) == 60
+    assert any('ended after 60 frames, expected 65' in str(w.message) for w in caught)
+    assert reader.nframes == 60
+    reader._nframes_counted += 5
+    import pytest
+    with pytest.raises(IndexError):
+        reader[62] # random access past the real end also corrects the count
+    assert reader.nframes == 60
+
 def test_video_slicing_and_iteration(tmp_path):
     filename = tmp_path / 'slicing.mp4'
     with VideoWriter(filename, fps=25, g='12') as writer:

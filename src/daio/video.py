@@ -90,7 +90,10 @@ class VideoReader:
             ok = self._first_packet_pos() == first
         except av.FFmpegError:
             ok = False
-        self._open()
+        if ok:
+            self.container.seek(0)
+        else:
+            self._open()
         return ok
 
     def _container_index(self):
@@ -121,7 +124,7 @@ class VideoReader:
             keep = ~discard
             self._set_index(ts[keep], ts[keep & kf], ts[keep & kf], source='container', frame_pos=pos[keep])
             return self._calibrate()
-        uniform = np.all(np.abs(np.diff(ts) - self._pts_per_frame) <= self.wiggle_pts)
+        uniform = np.all(np.abs(np.diff(ts) - float(self._pts_per_frame)) <= float(self.wiggle_pts))
         is_avi = self.container.format.name == 'avi' # avi time stamps are synthesized; always use an index
         if uniform and not discard.any() and self.stream.average_rate == self.stream.guessed_rate and not is_avi:
             first = self._first_frame()

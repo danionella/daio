@@ -1,4 +1,4 @@
-![Python Version](https://img.shields.io/badge/python-3.8+-blue)
+![Python Version](https://img.shields.io/badge/python-3.10+-blue)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 ![tests](https://github.com/danionella/daio/actions/workflows/test.yml/badge.svg)
 [![PyPI - Version](https://img.shields.io/pypi/v/daio)](https://pypi.org/project/daio/)

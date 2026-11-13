@@ -551,9 +551,8 @@ class VideoWriter:
         pix_fmt (str): pixel format of the encoded video. Default is 'yuv420p' (with libx264/libx265, frame height and
             width must then be even).
         audio_rate (int): sample rate of an audio stream to write with `write_audio`. Default is None (the audio stream
-            is created by the first call to `write_audio`, which must then come before the first video frame is
-            written, unless frame_shape is None). Audio written before the video stream exists is kept in memory
-            until the first video frame is written (or until close()).
+            is created by the first call to `write_audio`). Streams cannot be added once data was written: to write
+            audio and video, pass audio_rate (if video comes first) or frame_shape (if audio comes first).
         audio_channels (int): number of audio channels (1 or 2) if audio_rate is given. Default is 1.
         **kwargs: additional keyword arguments to pass to the codec. Check e.g. `ffmpeg -h encoder=libx264`
     """
@@ -563,7 +562,6 @@ class VideoWriter:
         self.container = av.open(filename, mode='w')
         self._closed = False
         self._n_muxed = 0
-        self._pending = []  # packets held back until the video stream exists (streams cannot be added once muxing has started)
         self._next_pts = 0
         self.stream = None
         self.audio_stream = None
@@ -604,15 +602,13 @@ class VideoWriter:
             raise
         self.stream = stream
         self.frame_shape = (height, width)
-        self._mux_packets(self._pending)
-        self._pending = []
 
     def _add_audio_stream(self, audio_rate, channels, stream_args=None):
         if channels not in (1, 2):
             raise ValueError(f'Only mono and stereo audio are supported, not {channels} channels.')
         if self._n_muxed:
-            raise ValueError('Cannot add an audio stream after video frames were written. Pass audio_rate (and '
-                             'audio_channels) to VideoWriter() to write audio and video in any order.')
+            raise ValueError('Cannot add an audio stream after video was written: pass audio_rate (and audio_channels) '
+                             'to VideoWriter().')
         self.channel_layout = 'mono' if channels == 1 else 'stereo'
         if stream_args is None:
             stream_args = dict(codec_name='aac', rate=audio_rate, layout=self.channel_layout)
@@ -622,9 +618,6 @@ class VideoWriter:
         self.audio_pts = 0
 
     def _mux_packets(self, packets):
-        if self.stream is None: # the video stream may still be added: hold back packets
-            self._pending.extend(packets)
-            return
         for packet in packets:
             self.container.mux(packet)
             self._n_muxed += 1
@@ -646,6 +639,8 @@ class VideoWriter:
         else:
             raise ValueError(f"Unsupported frame shape: {im.shape}")
         if self.stream is None:
+            if self._n_muxed:
+                raise ValueError('Cannot add the video stream after audio was written: pass frame_shape to VideoWriter().')
             self._add_video_stream(im.shape[0], im.shape[1])
         elif im.shape[:2] != self.frame_shape:
             raise ValueError(f'Frame shape {im.shape[:2]} differs from the video frame shape {self.frame_shape}.')
@@ -712,10 +707,6 @@ class VideoWriter:
                 # flush the encoder (not if it could not be opened, e.g. after an unsupported frame size: PyAV crashes)
                 if stream is not None and stream.codec_context.is_open:
                     self._mux_packets(stream.encode())
-            for packet in self._pending: # audio only: packets held back for a video stream that was never added
-                self.container.mux(packet)
-                self._n_muxed += 1
-            self._pending = []
             if self._n_muxed == 0 and not getattr(self, '_exiting_on_error', False):
                 warnings.warn(f'{self.filename}: VideoWriter closed without any frames, no file was written.', stacklevel=2)
         finally:

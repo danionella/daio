@@ -533,10 +533,12 @@ class VideoWriter:
         codec (str): codec to use. Default is 'libx264'. Other options include 'h264', etc. Check VideoWriter.codecs_available for a list of available codecs.
         fps (int, float or Fraction): frames per second. Default is 25. Floats are converted to fractions (e.g. 29.97 -> 2997/100).
         frame_shape (tuple): shape of the frames. Default is None (to be determined by the first frame written).
-        pix_fmt (str): pixel format of the encoded video. Default is 'yuv420p' (frame height and width must be even).
+        pix_fmt (str): pixel format of the encoded video. Default is 'yuv420p' (with libx264/libx265, frame height and
+            width must then be even).
         audio_rate (int): sample rate of an audio stream to write with `write_audio`. Default is None (the audio stream
             is created by the first call to `write_audio`, which must then come before the first video frame is
-            written, unless frame_shape is None).
+            written, unless frame_shape is None). Audio written before the video stream exists is kept in memory
+            until the first video frame is written (or until close()).
         audio_channels (int): number of audio channels (1 or 2) if audio_rate is given. Default is 1.
         **kwargs: additional keyword arguments to pass to the codec. Check e.g. `ffmpeg -h encoder=libx264`
     """
@@ -544,6 +546,7 @@ class VideoWriter:
     def __init__(self, filename, codec='libx264', fps=25, frame_shape=None, pix_fmt='yuv420p', audio_rate=None, audio_channels=1, **kwargs):
         self.container = av.open(filename, mode='w')
         self._closed = False
+        self._n_muxed = 0
         self._pending = []  # packets held back until the video stream exists (streams cannot be added once muxing has started)
         self._muxing = False
         self._next_pts = 0
@@ -554,11 +557,11 @@ class VideoWriter:
             kwargs = {**dict(bit_rate='1000000'), **kwargs}
         elif codec == 'libx264':
             kwargs = {**dict(crf='23', preset='superfast'), **kwargs}
-        self.codec = codec
-        self.fps = Fraction(fps).limit_denominator(1001) if isinstance(fps, float) else fps
-        self.pix_fmt = pix_fmt
-        self.kwargs = {k: str(v) for k, v in kwargs.items()} # codec options must be strings
         try:
+            self.codec = codec
+            self.fps = Fraction(fps).limit_denominator(1001) if isinstance(fps, float) else fps
+            self.pix_fmt = pix_fmt
+            self.kwargs = {k: str(v) for k, v in kwargs.items() if v is not None} # codec options must be strings
             if audio_rate is not None:
                 self._add_audio_stream(audio_rate, audio_channels)
             #add video stream, if frame_shape is provided (otherwise create when the first frame is written)
@@ -570,11 +573,21 @@ class VideoWriter:
             raise
 
     def _add_video_stream(self, height, width):
-        comps = av.VideoFormat(self.pix_fmt, 2, 2).components  # chroma subsampling: chroma planes are smaller than 2x2
-        if (width % 2 and min(c.width for c in comps) < 2) or (height % 2 and min(c.height for c in comps) < 2):
-            raise ValueError(f'Frame size {height}x{width} (height x width) is not supported with pix_fmt={self.pix_fmt!r}: '
-                             f'height and width must be even. Crop or pad the frames, or use e.g. pix_fmt="yuv444p".')
-        self.stream = self.container.add_stream(self.codec, rate=self.fps, height=height, width=width, pix_fmt=self.pix_fmt, options=self.kwargs)
+        stream = self.container.add_stream(self.codec, rate=self.fps, height=height, width=width, pix_fmt=self.pix_fmt, options=self.kwargs)
+        try:
+            stream.codec_context.open() # open the encoder now, so that unsupported settings raise a clear error here
+        except av.FFmpegError as e:
+            # the file cannot be completed with a stream whose encoder failed to open: close the writer
+            self._closed = True
+            self.container.close()
+            comps = av.VideoFormat(self.pix_fmt, 2, 2).components
+            subsampled = min(c.width for c in comps) < 2 or min(c.height for c in comps) < 2
+            if (height % 2 or width % 2) and subsampled:
+                raise ValueError(f'The {self.codec} encoder does not support frame size {height}x{width} (height x width) '
+                                 f'with pix_fmt={self.pix_fmt!r}: height and width must be even. Crop or pad the frames, '
+                                 f'or use e.g. pix_fmt="yuv444p".') from e
+            raise
+        self.stream = stream
         self.frame_shape = (height, width)
         self._mux_packets(self._pending)
         self._pending = []
@@ -587,7 +600,7 @@ class VideoWriter:
                              'audio_channels) to VideoWriter() to write audio and video in any order.')
         self.channel_layout = 'mono' if channels == 1 else 'stereo'
         if stream_args is None:
-            stream_args = dict(codec_name='aac', rate=44100, layout=self.channel_layout)
+            stream_args = dict(codec_name='aac', rate=audio_rate, layout=self.channel_layout)
         self.audio_stream = self.container.add_stream(**stream_args)
         self.audio_rate = audio_rate
         self.audio_channels = channels
@@ -600,6 +613,7 @@ class VideoWriter:
         for packet in packets:
             self._muxing = True
             self.container.mux(packet)
+            self._n_muxed += 1
 
     def write(self, im, pts=None):
         """ Write a frame to the video file
@@ -609,6 +623,8 @@ class VideoWriter:
             pts (int): presentation timestamp of the frame, in units of 1/fps. Must increase from frame to frame.
                 Default is None (the frame after the previous one; don't use unless you know what you are doing)
         """
+        if self._closed:
+            raise ValueError('Cannot write to a closed VideoWriter.')
         if im.ndim == 2:
             format = 'gray'
         elif im.ndim == 3 and im.shape[2] == 3:
@@ -621,6 +637,8 @@ class VideoWriter:
             raise ValueError(f'Frame shape {im.shape[:2]} differs from the video frame shape {self.frame_shape}.')
         if pts is None:
             pts = self._next_pts
+        elif pts != int(pts):
+            raise ValueError(f'pts must be an integer (in units of 1/fps), got {pts}.')
         elif int(pts) < self._next_pts:
             raise ValueError(f'pts must increase from frame to frame: got {pts} after {self._next_pts - 1}.')
         out_frame = av.VideoFrame.from_ndarray(im, format=format)
@@ -642,6 +660,8 @@ class VideoWriter:
             pts (int): presentation timestamp of the audio chunk, in samples. Default is None (auto-increment)
             stream_args (dict): additional arguments to pass to the audio stream (if it is created by this call).
         """
+        if self._closed:
+            raise ValueError('Cannot write to a closed VideoWriter.')
         audio_chunk = np.asarray(audio_chunk)
         if audio_chunk.ndim == 1:
             audio_chunk = audio_chunk[None]
@@ -680,9 +700,10 @@ class VideoWriter:
                     self._mux_packets(stream.encode())
             for packet in self._pending: # audio only: packets held back for a video stream that was never added
                 self.container.mux(packet)
+                self._n_muxed += 1
             self._pending = []
-            if self.stream is None and self.audio_stream is None:
-                warnings.warn('VideoWriter closed without frames: no file was written.', stacklevel=2)
+            if self._n_muxed == 0 and not getattr(self, '_exiting_on_error', False):
+                warnings.warn('VideoWriter closed without any frames: no file was written.', stacklevel=2)
         finally:
             self.container.close()
 
@@ -696,6 +717,7 @@ class VideoWriter:
         return self
     
     def __exit__(self, exc_type, exc_value, traceback):
+        self._exiting_on_error = exc_type is not None
         self.close()
         return False
     

@@ -271,6 +271,34 @@ print('ok')
         writer.write(np.zeros((65, 97), np.uint8))
     assert VideoReader(tmp_path / 'odd444.mp4').shape == (1, 65, 97)
 
+def test_videowriter_odd_frame_size_other_codecs(tmp_path):
+    """ Codecs that support odd frame sizes with chroma subsampling keep working. """
+    for codec, pix_fmt, ext in [('ffv1', 'yuv420p', 'mkv'), ('mpeg4', 'yuv420p', 'avi'), ('mjpeg', 'yuvj420p', 'avi')]:
+        filename = tmp_path / f'odd_{codec}.{ext}'
+        with VideoWriter(filename, codec=codec, pix_fmt=pix_fmt) as writer:
+            for i in range(3):
+                writer.write(np.full((65, 97), i * 50, np.uint8))
+        assert VideoReader(filename).shape == (3, 65, 97), codec
+
+def test_videowriter_misc_validation(tmp_path):
+    import pytest
+    writer = VideoWriter(tmp_path / 'closed.mp4')
+    writer.write(np.zeros((64, 96), np.uint8))
+    with pytest.raises(ValueError, match='integer'):
+        writer.write(np.zeros((64, 96), np.uint8), pts=1.5)
+    writer.close()
+    with pytest.raises(ValueError, match='closed'):
+        writer.write(np.zeros((64, 96), np.uint8))
+    with VideoWriter(tmp_path / 'none_option.mp4', tune=None) as writer: # None options are ignored
+        writer.write(np.zeros((64, 96), np.uint8))
+    with warnings.catch_warnings():
+        warnings.simplefilter('error') # a failed __init__ must not warn about an empty file on top of its error
+        with pytest.raises(ValueError):
+            VideoWriter(tmp_path / 'bad.mp4', fps=float('nan'))
+        import gc; gc.collect()
+    with pytest.warns(UserWarning, match='no file'): # declared audio stream, but nothing written
+        VideoWriter(tmp_path / 'empty_audio.mp4', audio_rate=44100).close()
+
 def _audio_info(filename):
     import av
     with av.open(str(filename)) as container:
@@ -303,6 +331,12 @@ def test_videowriter_audio(tmp_path):
                     if not audio_first:
                         writer.write_audio(stereo)
             assert _audio_info(filename) == {'audio': ('stereo', 3.0), 'video': (75, 3.0)}
+    # the audio stream uses the given sample rate
+    with VideoWriter(tmp_path / 'rate48k.mp4', audio_rate=48000) as writer:
+        writer.write_audio(np.zeros(48000, np.float32))
+    import av
+    with av.open(str(tmp_path / 'rate48k.mp4')) as container:
+        assert container.streams.audio[0].rate == 48000
     # without declaration: audio before the first video frame works
     with VideoWriter(tmp_path / 'audio_first.mp4') as writer:
         writer.write_audio(stereo, sr)

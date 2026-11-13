@@ -498,6 +498,41 @@ def test_lazyh5_attribute_access_to_underscore_keys(tmp_path):
     assert h5._meta == 5 # attribute access works for keys starting with '_', as in earlier versions
 
 
+def test_hdf5_review_followups(tmp_path, monkeypatch):
+    import pytest
+    import daio.h5
+    filename = tmp_path / 'followups.h5'
+    # integer lists that float64 cannot represent exactly stay exact; mixed int/float lists stay float arrays
+    save_to_h5(filename, {'big': [-1, 2**63 + 1], 'mixed': [1, 2.5]}, verbosity=0)
+    loaded = load_from_h5(filename)
+    assert loaded['big'] == [-1, 2**63 + 1] and loaded['mixed'].dtype == np.float64
+    # bytes lists with NUL or non-ASCII bytes are refused (they used to be silently truncated), before writing
+    save_to_h5(filename, {'precious': np.arange(3)}, verbosity=0)
+    with pytest.raises(TypeError):
+        save_to_h5(filename, {'l': [b'ab\x00', b'\xff\x00']}, verbosity=0)
+    assert np.array_equal(load_from_h5(filename)['precious'], np.arange(3))
+    save_to_h5(filename, {'l': [b'ab', b'cd']}, verbosity=0) # plain ASCII bytes lists are stored (and load as str)
+    assert list(load_from_h5(filename)['l']) == ['ab', 'cd']
+    # a failed nested key ('a/b') also removes the group it created
+    h5 = lazyh5(tmp_path / 'nested.h5')
+    original = daio.h5._write_node
+    def failing_write_node(group, key, node):
+        if key == 'a/b':
+            group.create_group('a') # (h5py creates the intermediate group before failing)
+            raise OSError('simulated write error')
+        original(group, key, node)
+    monkeypatch.setattr(daio.h5, '_write_node', failing_write_node)
+    with pytest.raises(OSError):
+        h5.from_dict({'a/b': 1})
+    monkeypatch.undo()
+    assert h5.keys() == []
+    # '~' is expanded consistently
+    monkeypatch.setenv('HOME', str(tmp_path))
+    home = lazyh5('~/home.h5')
+    home['a'] = 1
+    assert home.keys() == ['a'] and home['a'] == 1 and (tmp_path / 'home.h5').exists()
+
+
 def test_hdf5_dataframe(tmp_path):
     import pytest
     pd = pytest.importorskip('pandas')

@@ -67,12 +67,17 @@ def load_from_h5(filename, h5path='/'):
         return _read_group(h5file[_normalize_h5path(h5path)], filename)
 
 
+_available_compression = set() # named filters that were found to work
+
+
 def _check_compression(compression):
     """ Raise (before any file is opened) if a compression filter is not available. """
-    if compression is None:
+    if compression is None or (isinstance(compression, str) and compression in _available_compression):
         return
     with h5py.File(io.BytesIO(), 'w') as f:
         f.create_dataset('test', data=np.zeros(4), compression=compression)
+    if isinstance(compression, str):
+        _available_compression.add(compression)
 
 
 def _normalize_h5path(h5path):
@@ -115,12 +120,19 @@ def _list_to_array(obj):
         arr = np.asarray(obj)
     except (ValueError, TypeError):
         return None
-    if arr.dtype.kind in 'iufc':
+    if arr.dtype.kind in 'iu':
         return arr
-    if arr.dtype.kind == 'U' and _all_str(np.asarray(obj, dtype=object)):
-        return arr.astype(object)
-    if arr.dtype.kind == 'S' and all(isinstance(x, bytes) for x in np.asarray(obj, dtype=object).flat):
+    if arr.dtype.kind in 'fc':
+        # integers that the float array cannot represent exactly (e.g. [-1, 2**63 + 1]): keep them exact as JSON
+        if any(isinstance(x, int) and not isinstance(x, bool) and abs(x) > 2**53 for x in np.asarray(obj, dtype=object).flat):
+            return None
         return arr
+    if arr.dtype.kind == 'U': # (check the original elements: numpy converts [1, 'a'] to ['1', 'a'])
+        return arr.astype(object) if _all_str(np.asarray(obj, dtype=object)) else None
+    if arr.dtype.kind == 'S':
+        # (numpy bytes arrays drop trailing NUL bytes, and HDF5 strings hold text: only plain ASCII bytes are stored)
+        if all(isinstance(x, bytes) and b'\x00' not in x and x.isascii() for x in np.asarray(obj, dtype=object).flat):
+            return arr
     return None
 
 
@@ -149,8 +161,9 @@ def _native(item):
         return None
     if isinstance(item, np.ndarray):
         if item.dtype.kind in 'UO':
-            if _all_str(item.astype(object)): # (str without NUL characters)
-                return item.astype(object), h5py.string_dtype(), {}
+            as_obj = item.astype(object)
+            if _all_str(as_obj): # (str without NUL characters)
+                return as_obj, h5py.string_dtype(), {}
             return None
         return item, None, {}
     if isinstance(item, (list, tuple)):
@@ -238,10 +251,14 @@ def _write_items(group, prepared, overwrite=False):
         raise KeyExistsError(f"Dataset or group {', '.join(repr(k) for k in existing)} already exists in '{group.name}'!")
     for key, node in items.items():
         if key not in group:
+            root = key.split('/')[0] # (keys like 'a/b' create the group 'a')
+            created_root = root not in group
             try:
                 _write_node(group, key, node)
             except BaseException: # do not leave a partially written item behind
-                if key in group:
+                if created_root and root in group:
+                    del group[root]
+                elif key in group:
                     del group[key]
                 raise
             continue
@@ -312,6 +329,8 @@ class lazyh5:
     def __init__(self, filepath, h5path='/', readonly=None, erase_existing=False):
         if erase_existing and readonly:
             raise ValueError('erase_existing=True cannot be combined with readonly=True.')
+        if isinstance(filepath, (str, os.PathLike)):
+            filepath = expanduser(filepath) # (like save_to_h5 and load_from_h5)
         self._filepath = filepath
         self._h5path = _normalize_h5path(h5path)
         if erase_existing and isfile(filepath):

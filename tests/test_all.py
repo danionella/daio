@@ -175,16 +175,6 @@ def test_video_truncated_file_warns(tmp_path):
             assert sum(1 for _ in reader) == len(reference)
     assert any('damaged' in str(w.message) for w in caught)
 
-def test_video_without_timestamps_is_read_sequentially(tmp_path):
-    """ Raw H.264 streams have no time stamps: no frame index is possible, but all frames are read correctly. """
-    filename = tmp_path / 'raw.h264'
-    with VideoWriter(filename, fps=25, g='12') as writer:
-        writer.write_frames(_ramp_frames(60))
-    _unreliable(filename)
-    with warnings.catch_warnings():
-        warnings.simplefilter('ignore')
-        assert VideoReader(filename).nframes == 60
-
 def _write_leading_frames_without_timestamps(filename, n=60, n_negative=20):
     """ mkv whose first frames have negative time stamps, which the muxer stores without time stamps. """
     from fractions import Fraction
@@ -199,73 +189,48 @@ def _write_leading_frames_without_timestamps(filename, n=60, n_negative=20):
         for packet in stream.encode():
             container.mux(packet)
 
-def test_video_leading_frames_without_timestamps(tmp_path):
-    """ Seeking to time stamp 0 skips such frames: they must still be counted and read. """
-    filename = tmp_path / 'leading.mkv'
-    _write_leading_frames_without_timestamps(filename)
-    reference = _decode_all(filename)
-    assert len(reference) == 60
-    _unreliable(filename)
-    with warnings.catch_warnings():
-        warnings.simplefilter('ignore')
-        reader = VideoReader(filename)
-        assert reader.nframes == 60 and sum(1 for _ in reader) == 60
-
-def test_video_file_objects(tmp_path):
-    """ File-like objects are rewound when the file is re-opened. """
+def test_video_streams_without_timestamps(tmp_path):
+    """ Files with (some) frames without time stamps are read sequentially, from paths and file objects:
+    raw H.264, an mkv whose leading frames have no time stamps (seeking to 0 skips them), a raw H.264 stream cut
+    mid-GOP (packets before the first key frame are not decoded) and raw MJPEG (packets without file positions). """
     import io
-    raw, leading = tmp_path / 'raw.h264', tmp_path / 'leading.mkv'
-    with VideoWriter(raw, fps=25, g='12') as writer:
+    raw, leading, cut, mjpeg = (tmp_path / name for name in ['raw.h264', 'leading.mkv', 'cut.h264', 'raw.mjpeg'])
+    with VideoWriter(raw, fps=25, g='12', **{'x264-params': 'repeat-headers=1'}) as writer:
         writer.write_frames(_ramp_frames(60))
     _write_leading_frames_without_timestamps(leading)
-    for filename in [raw, leading]:
-        reference = _decode_all(filename)
-        for source in [open(filename, 'rb'), io.BytesIO(filename.read_bytes())]:
-            with warnings.catch_warnings():
-                warnings.simplefilter('ignore')
-                with VideoReader(source) as reader:
-                    assert reader.nframes == len(reference)
-                    _check_random_access(reader, reference, n_random=10)
-            source.close()
-
-def test_video_raw_streams(tmp_path):
-    """ Raw streams: a raw H.264 stream cut mid-GOP (packets before the first key frame are not decoded) and raw
-    MJPEG (packets without file positions). """
-    src, cut = tmp_path / 'src.h264', tmp_path / 'cut.h264'
-    with VideoWriter(src, fps=25, g='12', **{'x264-params': 'repeat-headers=1'}) as writer:
-        writer.write_frames(_ramp_frames(60))
-    with av.open(str(src)) as container: # a raw stream is just its packets: drop the first ones (mid-GOP cut)
+    with av.open(str(raw)) as container: # a raw stream is just its packets: drop the first ones (mid-GOP cut)
         cut.write_bytes(b''.join(bytes(p) for k, p in enumerate(container.demux(video=0)) if k >= 5 and p.size))
-    mjpeg = tmp_path / 'raw.mjpeg'
     with VideoWriter(mjpeg, codec='mjpeg', pix_fmt='yuvj420p', fps=25) as writer:
         writer.write_frames(_ramp_frames(30))
-    for filename in [cut, mjpeg]:
+    for filename, seekable in [(raw, False), (leading, False), (cut, False), (mjpeg, True)]:
         reference = _decode_all(filename)
-        with warnings.catch_warnings():
-            warnings.simplefilter('ignore')
-            with VideoReader(filename) as reader:
-                assert reader.nframes == len(reference), filename.name
-                _check_random_access(reader, reference, n_random=10)
+        for source in [filename, open(filename, 'rb'), io.BytesIO(filename.read_bytes())]:
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter('always')
+                with VideoReader(source) as reader:
+                    assert reader.nframes == len(reference), (filename.name, source)
+                    _check_random_access(reader, reference, n_random=10)
+                    assert sum(1 for _ in reader) == len(reference) and reader.seekable == seekable
+            assert seekable or any('seeking is not reliable' in str(w.message) for w in caught)
+            if hasattr(source, 'close'):
+                source.close()
 
 def test_video_frame_count_corrected_when_video_ends_early(tmp_path):
     """ Without a frame index, frames are counted from packets; if fewer frames decode, the count is corrected. """
+    import pytest
     filename = tmp_path / 'raw.h264'
     with VideoWriter(filename, fps=25, g='12') as writer:
         writer.write_frames(_ramp_frames(60))
-    with warnings.catch_warnings():
-        warnings.simplefilter('ignore')
-        reader = VideoReader(filename)
-    reader._nframes_counted += 5 # simulate packets that do not decode (e.g. damaged)
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter('always')
-        assert sum(1 for _ in reader) == 60
+        reader = VideoReader(filename)
+        reader._nframes_counted += 5 # simulate packets that do not decode (e.g. damaged)
+        assert sum(1 for _ in reader) == 60 and reader.nframes == 60
+        reader._nframes_counted += 5
+        with pytest.raises(IndexError):
+            reader[62] # random access past the real end also corrects the count
+        assert reader.nframes == 60
     assert any('ended after 60 frames, expected 65' in str(w.message) for w in caught)
-    assert reader.nframes == 60
-    reader._nframes_counted += 5
-    import pytest
-    with pytest.raises(IndexError):
-        reader[62] # random access past the real end also corrects the count
-    assert reader.nframes == 60
 
 def test_video_slicing_and_iteration(tmp_path):
     filename = tmp_path / 'slicing.mp4'

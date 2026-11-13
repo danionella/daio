@@ -494,3 +494,15 @@ def test_videowriter_options(tmp_path):
     assert 'libx264' in VideoWriter.codecs_available # also works on the class
     with pytest.warns(UserWarning, match='no file'):
         VideoWriter(tmp_path / 'empty.mp4').close()
+
+def test_import_does_not_change_warning_filters():
+    result = _run_isolated("""
+import warnings
+import numpy, av, h5py, hdf5plugin # dependencies may add their own filters
+warnings.filterwarnings('error', category=RuntimeWarning)
+before = list(warnings.filters)
+import daio.video, daio.h5
+assert warnings.filters == before, warnings.filters[:3]
+print('ok')
+""")
+    assert result.returncode == 0 and 'ok' in result.stdout, result.stderr[-2000:]

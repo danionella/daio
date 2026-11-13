@@ -5,7 +5,6 @@ import numpy as np
 import av
 from fractions import Fraction
 
-warnings.simplefilter("once")
 
 SCAN_NOTICE_BYTES = 1e9  # print a notice when scanning files larger than this to build a frame index
 

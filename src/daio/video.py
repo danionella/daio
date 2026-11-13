@@ -1,3 +1,4 @@
+import os
 import warnings
 
 import numpy as np
@@ -5,112 +6,467 @@ import av
 
 warnings.simplefilter("once")
 
+SCAN_NOTICE_BYTES = 1e9  # print a notice when scanning files larger than this to build a frame index
+
 class VideoReader:
-    ''' A class to read video files quickly, using PyAV. It allows for fast seeking and reading of frames. 
-    
+    ''' A class to read video files quickly, using PyAV. It allows for fast seeking and reading of frames.
+
+    Frame index `i` always refers to the i-th frame in presentation order, i.e. `reader[i]` returns the same frame as
+    the i-th frame obtained by sequential reading. To map frame indices to time stamps, the reader uses (in order of
+    preference, see `index` argument):
+
+    1. the container index (e.g. mp4/mov sample table), if it is complete and the stream has no B-frames (frame
+       reordering). The container index holds decode time stamps, which then equal presentation time stamps.
+    2. the nominal frame rate, if the container index shows evenly spaced frames (constant frame rate).
+    3. a frame index built by scanning all packet time stamps once (demuxing only, no decoding). This reads the
+       whole file, and is needed e.g. for variable frame rate videos with B-frames, or mkv/ts containers.
+
     Args:
         filename (str): path to the video file
         format (str): format to read the video in. Default is 'gray'. Other options include 'rgb24', 'yuv420p', etc.
         threading (bool): enable threading in the decoder. Default is True.
         thread_count (int): number of threads to use for decoding. Default is 0 (auto).
         tolerance (float): tolerance for frame time stamp deviations (fraction of frame interval). Default is 0.1.
+        index (str): how to map frame indices to time stamps. 'auto' (default): choose as described above (a file
+            scan is also done lazily if a seek lands on an unexpected time stamp). 'scan': always scan the file.
+            'nominal': always use the nominal frame rate (legacy behaviour; not reliable for variable frame rates).
+
+    Seeks are verified: the frame found by a seek must be a key frame where decoding starts, decoded time stamps must
+    increase, and (with a frame index) the frame must come from the expected position in the file. If a check fails
+    (e.g. avi files with B-frames, or with time stamps that change after seeking), a warning is issued and the reader
+    switches to sequential decoding (`seekable` becomes False): frames are still returned correctly, but jumping
+    backwards decodes from the start of the file, which can be slow.
     '''
-    def __init__(self, filename, format='gray', threading=True, thread_count=0, tolerance=0.1):
-        self.container = av.open(filename)
-        self.stream = self.container.streams.video[0]
-        self.stream.codec_context.thread_count = thread_count
-        self.stream.codec_context.thread_type = 'AUTO' if threading else 'SLICE' # FRAME/AUTO/SLICE
-        self.framegenerator = self.container.decode(video=0)
+    def __init__(self, filename, format='gray', threading=True, thread_count=0, tolerance=0.1, index='auto'):
+        if index not in ('auto', 'scan', 'nominal'):
+            raise ValueError(f"index must be 'auto', 'scan' or 'nominal', not {index!r}")
+        self.filename = filename
+        self._threading, self._thread_count = threading, thread_count
+        self._open()
         self.read_format = format
+        self.index_mode = index
+        self._start_time = self.stream.start_time or 0
         self._pts_per_frame = 1 / (self.stream.guessed_rate * self.stream.time_base)
-        self._frame_to_pts = lambda n: round(n * self._pts_per_frame) + self.stream.start_time
         self.wiggle_pts = tolerance * self._pts_per_frame
+        self._frame_pts = None  # sorted presentation time stamps of all frames (None: use nominal frame rate)
+        self._keyframe_pts = None  # presentation time stamps of key frames
+        self._keyframe_seek_ts = None  # time stamps to seek to for each key frame
+        self._frame_pos = None  # file position of each frame's packet (aligned with _frame_pts; -1: unknown)
+        self.seekable = True  # False: seeking is unreliable for this file, frames are decoded sequentially
+        self.index_source = None  # where the frame index came from: None (nominal frame rate), 'container' or 'scan'
+        if index == 'scan':
+            self.build_index()
+        elif index == 'auto':
+            self._auto_index()
+        else:
+            self._calibrate()
+        if self.container.format.name == 'avi' and self.stream.codec_context.has_b_frames:
+            self._check_initial_order()
         self.rewind()
-        if self.stream.average_rate != self.stream.guessed_rate:
-            warn_transcode(f'Average frame rate ({self.stream.average_rate}) is different from nominal frame rate ({self.stream.guessed_rate}). Seeking may be unrealiable. I will warn again if I detect seek gitches')
+        if index == 'nominal' and self.stream.average_rate != self.stream.guessed_rate:
+            warn_transcode(f'Average frame rate ({self.stream.average_rate}) is different from nominal frame rate ({self.stream.guessed_rate}). Seeking may be unrealiable. Consider using index="auto" or "scan".')
+
+    def _open(self):
+        ''' Open (or re-open) the file and configure the decoder. '''
+        if hasattr(self, 'container'):
+            self.container.close()
+        self.container = av.open(self.filename)
+        self.stream = self.container.streams.video[0]
+        self.stream.codec_context.thread_count = self._thread_count
+        self.stream.codec_context.thread_type = 'AUTO' if self._threading else 'SLICE' # FRAME/AUTO/SLICE
+        self.stream.codec_context.flags |= av.codec.context.Flags.copy_opaque # decoded frames carry their packet's file position
+
+    def _container_index(self):
+        ''' Read the container index (no file scan). Returns (timestamps, is_keyframe, is_discard, pos) arrays, or None if the
+        index is not complete (e.g. mkv/ts, fragmented mp4, avi with frame count mismatch). Timestamps are decode time
+        stamps (dts) in units of stream.time_base. '''
+        n = self.stream.frames
+        entries = self.stream.index_entries
+        if not n or len(entries) != n:
+            return None
+        rows = [(e.timestamp, e.pos, e.is_keyframe, e.is_discard) for e in entries]
+        ts, pos, kf, discard = (np.array(col) for col in zip(*rows))
+        return ts.astype(np.int64), kf.astype(bool), discard.astype(bool), pos.astype(np.int64)
+
+    def _auto_index(self):
+        ''' Choose the cheapest reliable way to map frame indices to time stamps (see class docstring). '''
+        cidx = self._container_index()
+        if cidx is None:
+            return self.build_index()
+        ts, kf, discard, pos = cidx
+        # container index positions can differ from packet positions by a constant (e.g. avi chunk headers)
+        self.rewind()
+        first_packet = next((p for p in self.container.demux(self.stream) if p.size), None)
+        if first_packet is not None and first_packet.pos >= 0 and pos[0] >= 0:
+            pos = pos + (first_packet.pos - pos[0])
+        if self.stream.codec_context.has_b_frames == 0:
+            # no frame reordering: decode time stamps are presentation time stamps
+            keep = ~discard
+            self._set_index(ts[keep], ts[keep & kf], ts[keep & kf], source='container', frame_pos=pos[keep])
+            return self._calibrate()
+        uniform = np.all(np.abs(np.diff(ts) - self._pts_per_frame) <= self.wiggle_pts)
+        is_avi = self.container.format.name == 'avi' # avi time stamps are synthesized; always use an index
+        if uniform and not discard.any() and self.stream.average_rate == self.stream.guessed_rate and not is_avi:
+            first = self._first_frame()
+            # constant frame rate: use nominal frame rate, if decoding starts with the first frame in the file
+            if first is not None and first.pts is not None and first.opaque is not None and first.opaque[0] == pos[0]:
+                self._start_time = first.pts
+                return
+        self.build_index()
+
+    def _first_frame(self):
+        ''' Decode and return the first frame (None if there is none). '''
+        self.rewind()
+        first = next(self.framegenerator, None)
+        self.rewind()
+        return first
+
+    def _calibrate(self):
+        ''' Align the frame index (or nominal start time) with the first frame the decoder actually outputs: removes
+        frames the decoder never outputs (e.g. when a stream starts mid-GOP) and, for the container index, a constant
+        offset between container and decoded time stamps. Also flags duplicate time stamps. '''
+        first = self._first_frame()
+        if first is None or first.pts is None:
+            return self._set_unseekable('decoded frames have no time stamps')
+        if self._frame_pts is None:
+            self._start_time = first.pts
+            return
+        if self.index_source == 'container':
+            ref = None
+            if first.opaque is not None and first.opaque[0] >= 0:
+                match = np.flatnonzero(self._frame_pos == first.opaque[0])
+                ref = self._frame_pts[match[0]] if len(match) else None
+            if ref is None:
+                return self._set_unseekable('cannot match the container index to decoded frames')
+            offset = first.pts - int(ref)
+            if offset:
+                self._frame_pts += offset
+                self._keyframe_pts += offset
+        keep = self._frame_pts >= first.pts # frames before the first decoded frame are never output by the decoder
+        self._frame_pts = self._frame_pts[keep]
+        if self._frame_pos is not None:
+            self._frame_pos = self._frame_pos[keep]
+        if len(self._frame_pts) == 0 or self._frame_pts[0] != first.pts:
+            return self._set_unseekable('frame index does not match decoded frames')
+        if np.any(np.diff(self._frame_pts) == 0):
+            return self._set_unseekable('duplicate time stamps')
+
+    def _set_index(self, frame_pts, kf_pts, kf_seek_ts, source, frame_pos=None):
+        frame_pts = np.asarray(frame_pts, dtype=np.int64)
+        order = np.argsort(frame_pts, kind='stable')
+        self._frame_pts = frame_pts[order]
+        self._frame_pos = None if frame_pos is None else np.asarray(frame_pos, dtype=np.int64)[order]
+        order = np.argsort(kf_pts, kind='stable')
+        self._keyframe_pts = np.asarray(kf_pts, dtype=np.int64)[order]
+        self._keyframe_seek_ts = np.asarray(kf_seek_ts, dtype=np.int64)[order]
+        self.index_source = source
+
+    def build_index(self):
+        ''' Scan all packets (without decoding) to build an exact map from frame index to presentation time stamp. '''
+        try:
+            size = os.path.getsize(self.filename)
+        except (TypeError, OSError): # e.g. file-like object or URL
+            size = 0
+        if size > SCAN_NOTICE_BYTES:
+            print(f'daio: scanning {os.path.basename(self.filename)} ({size / 1e9:.1f} GB) to build a frame index...', flush=True)
+        self.rewind()
+        pts, pos, kf_pts, kf_seek = [], [], [], []
+        n_corrupt = 0
+        for packet in self.container.demux(self.stream):
+            if packet.size == 0 or packet.is_discard: # flush packets or samples discarded by edit lists
+                continue
+            n_corrupt += packet.is_corrupt
+            ts = packet.pts if packet.pts is not None else packet.dts
+            if ts is None:
+                raise ValueError('Video packets have no time stamps. Cannot build a frame index. Consider transcoding (ffmpeg -y -i "input.mp4" -c:v libx264 -pix_fmt yuv420p -preset superfast -crf 23 "output.mp4").')
+            pts.append(ts)
+            pos.append(packet.pos)
+            if packet.is_keyframe:
+                kf_pts.append(ts)
+                kf_seek.append(ts if packet.dts is None else min(ts, packet.dts))
+        if n_corrupt:
+            self._warn_damaged(f'{n_corrupt} damaged packet(s) found, e.g. a truncated recording')
+        self._set_index(pts, kf_pts, kf_seek, source='scan', frame_pos=pos)
+        self._calibrate()
+        self.rewind()
+
+    @property
+    def has_index(self):
+        ''' Whether an exact frame index (from the container index or a file scan) is used. '''
+        return self._frame_pts is not None
+
+    def _frame_to_pts(self, n):
+        if self._frame_pts is not None:
+            return int(self._frame_pts[n])
+        return round(n * self._pts_per_frame) + self._start_time
+
+    @property
+    def frame_pts(self):
+        ''' Presentation time stamps of all frames (in units of stream.time_base). '''
+        if self._frame_pts is not None:
+            return self._frame_pts.copy()
+        return np.array([self._frame_to_pts(i) for i in range(self.nframes)], dtype=np.int64)
+
+    @property
+    def frame_times(self):
+        ''' Presentation times of all frames (in seconds). '''
+        return self.frame_pts * float(self.stream.time_base)
 
     def read(self):
         ''' Read the next frame in the specified format. '''
         frame_obj = next(self.framegenerator)
+        if frame_obj.is_corrupt:
+            self._warn_damaged(f'frame {self._next_idx} is corrupt')
+        if self.seekable and (frame_obj.pts is None or (self.last_pts is not None and frame_obj.pts <= self.last_pts)):
+            self._set_unseekable('decoded time stamps are missing or not increasing')
         self.last_pts = frame_obj.pts
+        self._next_idx += 1
         im = frame_obj.to_ndarray(format=self.read_format)
         return im
 
     def rewind(self):
         ''' Rewind the video to the beginning. '''
-        self.container.seek(0)
-        self.framegenerator = self.container.decode(video=0)
+        try:
+            self.container.seek(0)
+        except av.FFmpegError: # e.g. files that do not start with a key frame
+            self._open()
+        self.framegenerator = self._decode()
         self.last_pts = None
+        self._next_idx = 0
+
+    def _decode(self):
+        ''' Decode frames from the current position. Each frame carries its packet's file position and key frame flag
+        (frame.opaque). '''
+        self._landing_packet = None # first packet after a seek: (pos, is_keyframe, is_discard)
+        for packet in self.container.demux(self.stream):
+            packet.opaque = (packet.pos, packet.is_keyframe)
+            if self._landing_packet is None and packet.size:
+                self._landing_packet = (packet.pos, packet.is_keyframe, packet.is_discard)
+            try:
+                frames = packet.decode()
+            except av.InvalidDataError:
+                if not packet.is_corrupt:
+                    raise
+                self._warn_damaged(f'undecodable damaged packet at byte {packet.pos} skipped')
+                continue
+            yield from frames
+
+    def _warn_damaged(self, detail):
+        if not getattr(self, '_warned_damaged', False):
+            self._warned_damaged = True
+            warnings.warn(f'{self.filename}: video contains damaged data ({detail}). Frames decoded from damaged data '
+                          'may differ depending on how they are reached (sequentially or by seeking).', stacklevel=3)
+
+    def _set_unseekable(self, reason):
+        if self.seekable:
+            self.seekable = False
+            warnings.warn(f'{self.filename}: seeking is not reliable for this video ({reason}). Switching to sequential '
+                          'decoding: frames are still read correctly, but jumping backwards decodes from the start of '
+                          'the file, which can be slow. Consider transcoding (ffmpeg -y -i "input.avi" -c:v libx264 '
+                          '-pix_fmt yuv420p -preset superfast -crf 23 "output.mp4").', stacklevel=3)
+
+    def _check_initial_order(self, n=64):
+        ''' Check that the first n decoded frames have increasing time stamps (not the case e.g. for some avi files
+        with B-frames, where time stamps do not follow display order). '''
+        self.rewind()
+        last = None
+        for _ in range(n):
+            frame_obj = next(self.framegenerator, None)
+            if frame_obj is None:
+                break
+            if frame_obj.pts is None or (last is not None and frame_obj.pts <= last):
+                self._set_unseekable('decoded time stamps are missing or not in display order')
+                break
+            last = frame_obj.pts
+        self.rewind()
+
+    def _read_sequential(self, frame_idx):
+        ''' Read frame frame_idx by decoding sequentially (from the start if needed). '''
+        if frame_idx < self._next_idx:
+            self.rewind()
+        while self._next_idx < frame_idx:
+            if next(self.framegenerator, None) is None:
+                raise IndexError(f'frame index {frame_idx} out of range')
+            self._next_idx += 1
+        return self.read()
+
+    def _seek_ts_candidates(self, target_pts, frame_idx):
+        ''' Yield time stamps to seek to, going further back each time (to deal with overshoots). '''
+        yield target_pts
+        if self._keyframe_pts is not None:
+            k = np.searchsorted(self._keyframe_pts, target_pts, side='right') - 1
+            for j in range(k, max(k - 3, -1), -1):
+                yield int(self._keyframe_seek_ts[j])
+        elif frame_idx > 100:
+            yield self._frame_to_pts(frame_idx - 100)
+        yield None # decode from the start
+
+    def _seek_and_decode(self, frame_idx, target_pts):
+        ''' Seek to (and decode) the frame with presentation time stamp target_pts. Returns the frame object, or None
+        if seeking turned out to be unreliable (the reader then switches to sequential decoding). '''
+        exact = self._frame_pts is not None
+        wiggle = 0 if exact else self.wiggle_pts
+        frame_obj = None
+        for seek_ts in self._seek_ts_candidates(target_pts, frame_idx):
+            try:
+                if seek_ts is None:
+                    self.rewind()
+                else:
+                    self.container.seek(int(seek_ts), backward=True, stream=self.stream)
+            except av.FFmpegError:
+                continue
+            self.framegenerator = self._decode()
+            frame_obj = next(self.framegenerator, None)
+            if frame_obj is None:
+                continue
+            problem = None
+            if frame_obj.pts is None:
+                problem = 'decoded frames have no time stamps'
+            elif seek_ts is not None and not frame_obj.key_frame and not (self._landing_packet and self._landing_packet[2]):
+                # (unless the seek landed on a key frame that an edit list discards)
+                problem = 'decoding after a seek does not start at a key frame (e.g. intra refresh)'
+            elif frame_obj.pts > target_pts + wiggle: # overshoot (seek landed after the target)
+                continue
+            while problem is None and frame_obj.pts < target_pts - wiggle:
+                last = frame_obj.pts
+                frame_obj = next(self.framegenerator, None)
+                if frame_obj is None:
+                    break
+                if frame_obj.pts is None or frame_obj.pts <= last:
+                    problem = 'decoded time stamps are missing or not in display order'
+            if problem is None and frame_obj is not None and exact and frame_obj.pts == target_pts and self._frame_pos is not None:
+                expected_pos = self._frame_pos[frame_idx]
+                pos = None if frame_obj.opaque is None else frame_obj.opaque[0]
+                if expected_pos >= 0 and pos is not None and pos >= 0 and pos != expected_pos:
+                    problem = 'time stamps change after seeking'
+            if problem is not None:
+                self._set_unseekable(problem)
+                self.rewind()
+                return None
+            if frame_obj is None or (exact and frame_obj.pts != target_pts): # target frame was skipped; seek further back
+                continue
+            return frame_obj
+        if frame_obj is None:
+            self.rewind()
+            raise IndexError(f'could not read frame {frame_idx} (pts {target_pts})')
+        return frame_obj
 
     def read_frame(self, frame_idx):
-        ''' Read the specified frame index. 
-        
+        ''' Read the specified frame index.
+
         Args:
             frame_idx (int): index of the frame to read
         '''
+        frame_idx = int(frame_idx)
+        n = self.nframes
+        if n:
+            if frame_idx < 0:
+                frame_idx += n
+            if not 0 <= frame_idx < n:
+                raise IndexError(f'frame index {frame_idx} out of range for video with {n} frames')
+        elif frame_idx < 0:
+            raise IndexError('negative frame indices are not supported for videos with unknown frame count')
+        try:
+            return self._read_frame(frame_idx)
+        except StopIteration:
+            self.rewind()
+            raise IndexError(f'frame index {frame_idx} out of range') from None
+
+    def _read_frame(self, frame_idx):
         if frame_idx == 0:
             self.rewind()
             return self.read()
-        if self.last_pts is not None and (np.abs(self.last_pts - self._frame_to_pts(frame_idx-1)) <= self.wiggle_pts):
+        if frame_idx == self._next_idx:
             return self.read()
+        if not self.seekable:
+            return self._read_sequential(frame_idx)
         target_pts = self._frame_to_pts(frame_idx)
-        self.container.seek(target_pts-self.stream.start_time, backward=True, stream=self.container.streams.video[0])
-        self.framegenerator = self.container.decode(video=0)
-        frame_obj = next(self.framegenerator)
-        if frame_obj.pts > target_pts: #detecting overshoot (may happen due to variable frame rate)
-            n_back = 100
-            warn_transcode(f'Seek overshoot ({frame_obj.pts} > {target_pts}). Backtracking by {n_back} frames...')
-            self.container.seek(self._frame_to_pts(frame_idx-n_back)-self.stream.start_time, backward=True, stream=self.container.streams.video[0])
-            self.framegenerator = self.container.decode(video=0)
-            frame_obj = next(self.framegenerator)
-        while frame_obj.pts < (target_pts - self.wiggle_pts): 
-            frame_obj = next(self.framegenerator)
-        # frame_obj.pts should now be equal to target_pts
-        if np.abs(frame_obj.pts - target_pts) > self.wiggle_pts:
+        frame_obj = self._seek_and_decode(frame_idx, target_pts)
+        if frame_obj is None:
+            return self._read_sequential(frame_idx)
+        if np.abs(frame_obj.pts - target_pts) > (0 if self._frame_pts is not None else self.wiggle_pts):
+            if self.index_mode == 'auto' and self.index_source != 'scan':
+                warnings.warn(f'Unexpected time stamp when seeking to frame {frame_idx} (pts: {frame_obj.pts}; expected: {target_pts}). Irregular frame timing detected; scanning file to build a frame index.', stacklevel=2)
+                self.build_index()
+                return self._read_frame(frame_idx)
             warn_transcode(f'Seek problem with frame {frame_idx}! pts: {frame_obj.pts}; target: {target_pts}; dts: {frame_obj.dts}; pict_type: {str(frame_obj.pict_type)}')
+        if frame_obj.is_corrupt:
+            self._warn_damaged(f'frame {frame_idx} is corrupt')
         frame = frame_obj.to_ndarray(format=self.read_format)
         self.last_pts = frame_obj.pts
+        self._next_idx = frame_idx + 1
         return frame
-    
+
     def close(self):
+        if not hasattr(self, 'container'): # __init__ failed before the file was opened
+            return
         self.container.close()
         
     def __del__(self):
         self.close()
         
+    def _frame_indices(self, index):
+        ''' Frame indices selected by a slice, or by a list/array of integers. '''
+        if isinstance(index, slice):
+            n = self.nframes
+            if not n:
+                if index.start is None or index.stop is None or index.start < 0 or index.stop < 0 or (index.step or 1) < 0:
+                    raise IndexError('open-ended or negative slices need a known frame count')
+                return range(index.start, index.stop, index.step or 1)
+            return range(*index.indices(n))
+        indices = np.asarray(index)
+        if indices.dtype == bool or not np.issubdtype(indices.dtype, np.integer) or indices.ndim != 1:
+            raise IndexError(f'frames can be indexed with integers, slices or 1-d integer arrays, not {index!r}')
+        return [int(i) for i in indices]
+
+    def _stack(self, frames):
+        if frames:
+            return np.array(frames)
+        try:
+            return np.empty((0, *self.shape[1:]), dtype=self.dtype)
+        except NotImplementedError:
+            return np.empty((0,), dtype=self.dtype)
+
     def __getitem__(self, index):
         if isinstance(index, (int, np.integer)):  # single frame
             return self.read_frame(index)
-        elif isinstance(index, slice):
-            frames = [self.__getitem__(i) for i in np.r_[index]]
+        if isinstance(index, tuple):
+            first, rest = index[0], index[1:]
+            if isinstance(first, (int, np.integer)):
+                return self.read_frame(first)[rest]
+            frames = [self.read_frame(i)[rest] for i in self._frame_indices(first)]
+            if not frames:
+                return self._stack([])[(slice(None), *rest)]
             return np.array(frames)
-        elif isinstance(index, tuple):
-            frames = [self.__getitem__(i)[index[1:]] for i in np.r_[index[0]]]
-            if len(frames) == 1:
-                return frames[0]
-            else:
-                return np.array(frames)
-        else:
-            raise NotImplementedError(f"slicing of {type(index)} : {index} not implemented yet")
-    
+        return self._stack([self.read_frame(i) for i in self._frame_indices(index)])
+
+    def __len__(self):
+        return self.nframes
+
     def __enter__(self):
         return self
-    
+
     def __exit__(self, exc_type, exc_value, traceback):
         self.close()
         return False
-    
+
     def __iter__(self):
-        self.rewind()
-        return self
-    
+        ''' Iterate over all frames. Each loop keeps its own position, so nested loops or zip(reader, reader) work. '''
+        i = 0
+        while not self.nframes or i < self.nframes:
+            try:
+                frame = self.read_frame(i)
+            except IndexError:
+                if self.nframes: # end of video reached early (e.g. damaged file)
+                    warnings.warn(f'{self.filename}: video ended after {i} frames, expected {self.nframes}.', stacklevel=2)
+                return
+            yield frame
+            i += 1
+
     def __next__(self):
-        try:
-            return self.read()
-        except:
-            self.rewind()
-            raise StopIteration
-    
+        ''' Read the next frame (same as read()). '''
+        return self.read()
+
     @property
     def frame_shape(self):
         ''' Return the shape of the video frames. '''
@@ -119,7 +475,9 @@ class VideoReader:
     @property
     def nframes(self):
         ''' Return the number of frames in the video. '''
-        return self.container.streams.video[0].frames
+        if self._frame_pts is not None:
+            return len(self._frame_pts)
+        return self.stream.frames
 
     @property
     def dtype(self):
@@ -239,6 +597,8 @@ class VideoWriter:
 
     def close(self):
         """ Close the video file. """
+        if not hasattr(self, 'container'): # __init__ failed before the file was opened
+            return
         try:
             for packet in self.stream.encode():
                 self.container.mux(packet)

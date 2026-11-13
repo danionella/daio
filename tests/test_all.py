@@ -302,6 +302,168 @@ def test_video_failed_init_no_spurious_del_error(tmp_path):
         sys.unraisablehook = old_hook
     assert unraisable == [], [str(u.exc_value) for u in unraisable]
 
+def _run_isolated(code):
+    """ Run code in a fresh interpreter (importing daio from the same location as this test session). """
+    import os, subprocess, sys, daio
+    env = dict(os.environ, PYTHONPATH=os.pathsep.join([os.path.dirname(os.path.dirname(daio.__file__)), os.environ.get('PYTHONPATH', '')]))
+    return subprocess.run([sys.executable, '-c', code], capture_output=True, text=True, env=env, timeout=120)
+
+def test_videowriter_frame_sizes(tmp_path):
+    import pytest
+    # odd sizes with libx264/yuv420p raise a clear error, and closing does not crash the interpreter (subprocess)
+    result = _run_isolated(f"""
+import numpy as np
+from daio.video import VideoWriter
+for frame_shape in [None, (65, 97)]:
+    try:
+        with VideoWriter({str(tmp_path / 'odd.mp4')!r}, frame_shape=frame_shape) as writer:
+            writer.write(np.zeros((65, 97), np.uint8))
+    except ValueError as e:
+        assert 'even' in str(e), e
+    else:
+        raise AssertionError('no error')
+print('ok')
+""")
+    assert result.returncode == 0 and 'ok' in result.stdout, result.stderr[-2000:]
+    # codecs / pixel formats that support odd sizes keep working
+    for codec, pix_fmt, ext in [('libx264', 'yuv444p', 'mp4'), ('ffv1', 'yuv420p', 'mkv'), ('mpeg4', 'yuv420p', 'avi'), ('mjpeg', 'yuvj420p', 'avi')]:
+        filename = tmp_path / f'odd_{codec}.{ext}'
+        with VideoWriter(filename, codec=codec, pix_fmt=pix_fmt) as writer:
+            writer.write_frames([np.full((65, 97), i * 50, np.uint8) for i in range(3)])
+        assert VideoReader(filename).shape == (3, 65, 97), codec
+    # frames of a different shape raise (they used to be rescaled silently)
+    for frame_shape in [None, (64, 96)]:
+        with VideoWriter(tmp_path / 'shape.mp4', frame_shape=frame_shape) as writer:
+            writer.write(np.zeros((64, 96), np.uint8))
+            for bad in [np.zeros((128, 192), np.uint8), np.zeros((32, 96, 3), np.uint8)]:
+                with pytest.raises(ValueError, match='shape'):
+                    writer.write(bad)
+
+def _audio_info(filename):
+    with av.open(str(filename)) as container:
+        return {s.type: (s.codec_context.layout.name if s.type == 'audio' else s.frames, round(float(s.duration * s.time_base), 2))
+                for s in container.streams}
+
+def test_videowriter_audio(tmp_path):
+    import pytest
+    sr = 44100
+    t = np.arange(sr) / sr
+    stereo = (0.5 * np.stack([np.sin(2 * np.pi * 440 * t), np.sin(2 * np.pi * 660 * t)])).astype(np.float32)
+    frame = np.zeros((64, 96), np.uint8)
+    # audio only: mono/stereo, int16/float, 1-d/2-d
+    for name, chunk in {'mono_int16_1d': (stereo[0] * 32767).astype(np.int16), 'mono_float_2d': stereo[:1],
+                        'stereo_int16': (stereo * 32767).astype(np.int16), 'stereo_float64': stereo.astype(np.float64)}.items():
+        with VideoWriter(tmp_path / f'{name}.mp4') as writer:
+            for i in range(3):
+                writer.write_audio(chunk, sr)
+        assert _audio_info(tmp_path / f'{name}.mp4') == {'audio': ('mono' if 'mono' in name else 'stereo', 3.0)}, name
+    # audio and video: declare the stream that is written second (or both); with frame_shape, video is stream 0
+    for kwargs, audio_first in [({'frame_shape': (64, 96)}, True), ({'audio_rate': sr, 'audio_channels': 2}, False),
+                                ({'frame_shape': (64, 96), 'audio_rate': sr, 'audio_channels': 2}, True)]:
+        filename = tmp_path / f'av_{len(kwargs)}_{audio_first}.mp4'
+        with VideoWriter(filename, **kwargs) as writer:
+            for second in range(3):
+                if audio_first:
+                    writer.write_audio(stereo, sr)
+                writer.write_frames([frame] * 25)
+                if not audio_first:
+                    writer.write_audio(stereo)
+        assert _audio_info(filename) == {'video': (75, 3.0), 'audio': ('stereo', 3.0)}, kwargs
+        if 'frame_shape' in kwargs:
+            with av.open(str(filename)) as container:
+                assert container.streams[0].type == 'video'
+    # undeclared second stream: clear errors (streams cannot be added once data was written)
+    with VideoWriter(tmp_path / 'audio_first.mp4') as writer:
+        writer.write_audio(stereo, sr)
+        with pytest.raises(ValueError, match='frame_shape'):
+            writer.write(frame)
+    with VideoWriter(tmp_path / 'video_first.mp4') as writer:
+        writer.write_frames([frame] * 50)
+        with pytest.raises(ValueError, match='audio_rate'):
+            writer.write_audio(stereo, sr)
+    assert VideoReader(tmp_path / 'video_first.mp4').nframes == 50 # the video is still written
+    # the audio stream uses the given sample rate; channel mismatches raise
+    with VideoWriter(tmp_path / 'rate48k.mp4', audio_rate=48000) as writer:
+        writer.write_audio(np.zeros(48000, np.float32))
+    with av.open(str(tmp_path / 'rate48k.mp4')) as container:
+        assert container.streams.audio[0].rate == 48000
+    with pytest.raises(ValueError, match='channels'):
+        with VideoWriter(tmp_path / 'channels.mp4', audio_rate=sr) as writer:
+            writer.write_audio(stereo)
+
+def test_videowriter_validation(tmp_path):
+    import pytest
+    from fractions import Fraction
+    frame = np.zeros((64, 96), np.uint8)
+    with VideoWriter(tmp_path / 'pts.mp4') as writer:
+        writer.write_frames([np.full((64, 96), i * 8, np.uint8) for i in range(30)])
+        for pts, match in [(5, 'pts must increase'), (31.5, 'integer')]: # decreasing pts used to drop frames silently
+            with pytest.raises(ValueError, match=match):
+                writer.write(frame, pts=pts)
+    assert VideoReader(tmp_path / 'pts.mp4').nframes == 30
+    with VideoWriter(tmp_path / 'pts_mixed.mp4') as writer: # explicit pts followed by automatic pts
+        for pts in [10, None, None]:
+            writer.write(frame, pts=pts)
+    with VideoReader(tmp_path / 'pts_mixed.mp4', index='scan') as reader:
+        assert reader.nframes == 3 and np.allclose(np.diff(reader.frame_times), 1 / 25)
+    # frame rates: floats become fractions (low rates are not rounded to 0); invalid rates raise
+    for fps, expected in [(29.97, Fraction(2997, 100)), (30000 / 1001, Fraction(30000, 1001)), (1e-4, Fraction(1, 10000))]:
+        with VideoWriter(tmp_path / 'fps.mkv', fps=fps) as writer:
+            writer.write(frame)
+        assert writer.fps == expected, fps
+    for fps in [0, -1, 0.0, float('nan')]:
+        with pytest.raises(ValueError):
+            VideoWriter(tmp_path / 'badfps.mp4', fps=fps)
+    # codec options: non-string values are converted, None values ignored
+    with VideoWriter(tmp_path / 'options.mp4', crf=18, tune=None) as writer:
+        writer.write(frame)
+    assert 'libx264' in VideoWriter.codecs_available # also works on the class
+    with pytest.raises(ValueError, match='closed'):
+        writer.write(frame)
+
+def test_videowriter_close_and_warnings(tmp_path):
+    import pytest
+    frame = np.zeros((64, 96), np.uint8)
+    # errors while flushing are raised by close() (not swallowed); closing again is a no-op
+    writer = VideoWriter(tmp_path / 'flush.mp4')
+    writer.write(frame)
+    writer._mux_packets = lambda packets: (_ for _ in ()).throw(RuntimeError('flush failed'))
+    with pytest.raises(RuntimeError, match='flush failed'):
+        writer.close()
+    writer.close()
+    # ... but they do not replace an exception raised inside the with-block
+    class MyError(Exception):
+        pass
+    with pytest.raises(MyError), pytest.warns(UserWarning, match='closing'):
+        with VideoWriter(tmp_path / 'masked.mp4') as writer:
+            writer.write(frame)
+            writer._mux_packets = lambda packets: (_ for _ in ()).throw(RuntimeError('flush failed'))
+            raise MyError()
+    # empty writers warn, once per file (also with a declared audio stream); a failed __init__ does not
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter('default')
+        for name in ['empty1.mp4', 'empty2.mp4']:
+            VideoWriter(tmp_path / name).close()
+        VideoWriter(tmp_path / 'empty_audio.mp4', audio_rate=44100).close()
+    assert sum('no file was written' in str(w.message) for w in caught) == 3
+    with warnings.catch_warnings():
+        warnings.simplefilter('error')
+        with pytest.raises(ValueError):
+            VideoWriter(tmp_path / 'bad.mp4', fps=float('nan'))
+        import gc; gc.collect()
+
+def test_import_does_not_change_warning_filters():
+    result = _run_isolated("""
+import warnings
+import numpy, av, h5py, hdf5plugin # dependencies may add their own filters
+warnings.filterwarnings('error', category=RuntimeWarning)
+before = list(warnings.filters)
+import daio.video, daio.h5
+assert warnings.filters == before, warnings.filters[:3]
+print('ok')
+""")
+    assert result.returncode == 0 and 'ok' in result.stdout, result.stderr[-2000:]
+
 def test_hdf5(tmp_path):
     data = {
         'a': 1,

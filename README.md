@@ -49,7 +49,9 @@ for frame in reader:
 reader.close()
 ```
 
-Indexing is frame-accurate: `reader[i]` returns the same frame as the i-th frame read sequentially. Frames are located using the container index (mp4/mov without B-frames), or the nominal frame rate (constant frame rate mp4/mov with B-frames). In other cases (e.g. variable frame rate with B-frames, dropped frames, edit lists, or mkv/ts containers), `VideoReader` first scans all packet time stamps (no decoding, but reads the whole file) to build an exact frame index. You can force this with `VideoReader(path, index='scan')`; `reader.index_source` tells you which method is used. Per-frame presentation times (in seconds) are available as `reader.frame_times`.
+Indexing is frame-accurate: `reader[i]` returns the same frame as the i-th frame read sequentially. Frames are located using the container index (mp4/mov/avi without B-frames), or the nominal frame rate (constant frame rate mp4/mov with B-frames). In other cases (e.g. variable frame rate with B-frames, dropped frames, edit lists, or mkv/ts containers), `VideoReader` first scans all packet time stamps (no decoding, but reads the whole file) to build an exact frame index. You can force this with `VideoReader(path, index='scan')`; `reader.index_source` tells you which method is used. Per-frame presentation times (in seconds) are available as `reader.frame_times`.
+
+Every seek is verified (the frame must come from the expected position in the file, decoded time stamps must increase, and decoding must start at a real key frame). Some files cannot be seeked reliably, e.g. avi files with B-frames, files with duplicate time stamps, or intra-refresh streams. For those, `VideoReader` warns and switches to sequential decoding (`reader.seekable` becomes `False`): frames are still returned correctly, but jumping backwards decodes from the start of the file, which can be slow. Transcoding such files (e.g. `ffmpeg -i input.avi -c:v libx264 -pix_fmt yuv420p output.mp4`) makes them fast to seek again.
 
 You can also use with statements to handle file closure:
 ```python

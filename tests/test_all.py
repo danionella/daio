@@ -1,6 +1,9 @@
 # Run: pytest tests/test_all.py
 # All functions to be tested should start with test_ prefix
 
+import warnings
+
+import av
 import numpy as np
 from daio.video import VideoReader, VideoWriter
 from daio.h5 import lazyh5, save_to_h5, load_from_h5
@@ -24,11 +27,23 @@ def test_video(tmp_path):
         for frame in reader:
             frame.mean()
 
+def _decode_all(filename):
+    """ Reference: all frames from a plain sequential decode with PyAV. """
+    with av.open(str(filename)) as container:
+        return [frame.to_ndarray(format='gray') for frame in container.decode(video=0)]
+
+def _check_random_access(reader, reference, n_random=40, seed=0):
+    rng = np.random.default_rng(seed)
+    n = len(reference)
+    indices = list(rng.integers(0, n, n_random)) + [n - 1, 3, 4, 5, 13, 12, 11, 0, -1, -2]
+    for i in indices:
+        assert np.array_equal(reader[int(i)], reference[i]), f'frame {i}'
+
 def _write_video_with_gaps(filename, **kwargs):
     """ Write a video with missing frames (irregular time stamps), as produced by cameras that drop frames. """
     n = 120
     pts = [i for i in range(n) if not (40 <= i < 45) and i % 17 != 0] # drop a block of frames and every 17th frame
-    with VideoWriter(filename, fps=25, gop_size='12', **kwargs) as writer:
+    with VideoWriter(filename, fps=25, g='12', **kwargs) as writer:
         for p in pts:
             frame = np.full((64, 96), (p * 2) % 256, dtype='uint8') # brightness encodes the original frame number
             writer.write(frame, pts=p)
@@ -44,27 +59,91 @@ def test_video_irregular_timestamps(tmp_path):
     for ext, opts, auto_source in cases:
         filename = tmp_path / f'test_video_gaps_{len(opts)}.{ext}'
         pts = _write_video_with_gaps(filename, **opts)
-        sequential = list(VideoReader(filename))
-        assert len(sequential) == len(pts)
+        reference = _decode_all(filename)
+        assert len(reference) == len(pts)
         for index in ['auto', 'scan']:
             with VideoReader(filename, index=index) as reader:
                 assert reader.index_source == (auto_source if index == 'auto' else 'scan')
+                assert reader.seekable
                 assert reader.nframes == len(pts)
-                assert len(reader.frame_times) == len(pts)
-                rng = np.random.default_rng(0)
-                for i in list(rng.integers(0, len(pts), 30)) + [len(pts) - 1, 3, 4, 5, -1]:
-                    assert np.array_equal(reader[int(i)], sequential[i]), f'{ext}, index={index}, frame {i}'
+                assert np.allclose(reader.frame_times, np.array(pts) / 25)
+                _check_random_access(reader, reference)
+            assert all(np.array_equal(a, b) for a, b in zip(VideoReader(filename, index=index), reference))
 
 def test_video_cfr_uses_nominal_rate(tmp_path):
     filename = tmp_path / 'test_video_cfr.mp4'
     with VideoWriter(filename, fps=25) as writer:
         for i in range(50):
             writer.write(np.full((64, 96), i * 4, dtype='uint8'))
-    sequential = list(VideoReader(filename))
+    reference = _decode_all(filename)
     with VideoReader(filename) as reader:
         assert reader.index_source is None # constant frame rate mp4 (with B-frames): nominal frame rate, no file scan
-        for i in [30, 10, 49, 11, 12, 0, 25]:
-            assert np.array_equal(reader[i], sequential[i])
+        for i in [30, 10, 49, 11, 12, 0, 25, -1, -50]:
+            assert np.array_equal(reader[i], reference[i])
+        assert reader.index_source is None # negative indices must not trigger a file scan
+        for i in [50, -51, 1000]:
+            try:
+                reader[i]
+                assert False, f'no IndexError for {i}'
+            except IndexError:
+                pass
+        assert np.array_equal(reader[7], reference[7]) and np.array_equal(reader[8], reference[8]) # state ok after errors
+
+def _remux(src, dst, skip=0, pts_map=None):
+    """ Copy packets into a new file, optionally dropping the first `skip` packets or changing time stamps. """
+    with av.open(str(src)) as ic, av.open(str(dst), 'w') as oc:
+        ist = ic.streams.video[0]
+        ost = oc.add_stream_from_template(ist)
+        for k, packet in enumerate(ic.demux(ist)):
+            if packet.dts is None or k < skip:
+                continue
+            if pts_map is not None:
+                packet.pts = packet.dts = pts_map(packet.pts)
+            packet.stream = ost
+            oc.mux(packet)
+
+def _ramp_frames(n=120):
+    return [np.full((64, 96), (i * 2) % 256, dtype='uint8') for i in range(n)]
+
+def test_video_starting_mid_gop(tmp_path):
+    """ Streams that do not start with a key frame (e.g. cut recordings): frames the decoder drops are not counted. """
+    for bf in ['0', '2']:
+        src, cut = tmp_path / f'src{bf}.mkv', tmp_path / f'cut{bf}.mkv'
+        with VideoWriter(src, fps=25, g='12', bf=bf, **{'x264-params': 'repeat-headers=1'}) as writer:
+            writer.write_frames(_ramp_frames())
+        _remux(src, cut, skip=5)
+        reference = _decode_all(cut)
+        with warnings.catch_warnings():
+            warnings.simplefilter('error')
+            with VideoReader(cut) as reader:
+                assert reader.nframes == len(reference)
+                _check_random_access(reader, reference)
+                assert reader.seekable
+
+def _unreliable(filename):
+    """ Open a file that is expected to trigger the sequential fallback; check frames are still correct. """
+    reference = _decode_all(filename)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter('always')
+        with VideoReader(filename) as reader:
+            _check_random_access(reader, reference)
+            assert not reader.seekable
+    assert any('seeking is not reliable' in str(w.message) for w in caught)
+
+def test_video_avi_bframes_falls_back_to_sequential(tmp_path):
+    """ avi with H.264 B-frames: decoded time stamps are not in display order, so seeking cannot be trusted. """
+    filename = tmp_path / 'bframes.avi'
+    with VideoWriter(filename, fps=25, g='12') as writer:
+        writer.write_frames(_ramp_frames())
+    _unreliable(filename)
+
+def test_video_duplicate_timestamps_fall_back_to_sequential(tmp_path):
+    src, dup = tmp_path / 'src.mkv', tmp_path / 'dup.mkv'
+    with VideoWriter(src, fps=25, g='12', bf='0') as writer:
+        writer.write_frames(_ramp_frames())
+    step = 40 # mkv time base is 1 ms; 25 fps
+    _remux(src, dup, pts_map=lambda t: t - step if (t // step) % 10 == 5 else t)
+    _unreliable(dup)
 
 def test_video_scan_notice(tmp_path, capsys, monkeypatch):
     """ A one-line notice is printed when a large file is scanned to build a frame index. """

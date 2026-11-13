@@ -145,6 +145,44 @@ def test_video_duplicate_timestamps_fall_back_to_sequential(tmp_path):
     _remux(src, dup, pts_map=lambda t: t - step if (t // step) % 10 == 5 else t)
     _unreliable(dup)
 
+def test_video_slicing_and_iteration(tmp_path):
+    filename = tmp_path / 'slicing.mp4'
+    with VideoWriter(filename, fps=25, g='12') as writer:
+        writer.write_frames(_ramp_frames(40))
+    ref = np.array(_decode_all(filename))
+    with VideoReader(filename) as r:
+        assert len(r) == 40
+        for sl in [slice(None), slice(-3, None), slice(None, None, 5), slice(18, 60), slice(30, 10, -4), slice(5, 5)]:
+            out = r[sl]
+            assert out.shape == ref[sl].shape and np.array_equal(out, ref[sl]), sl
+        assert np.array_equal(r[[3, 1, 30, -1]], ref[[3, 1, 30, -1]])
+        assert np.array_equal(r[np.arange(4)], ref[:4])
+        assert np.array_equal(r[0:1, :10], ref[0:1, :10]) # frame axis is kept for slices
+        assert np.array_equal(r[2, :10, 5:8], ref[2, :10, 5:8])
+        assert np.array_equal(r[5:9, 3], ref[5:9, 3])
+        # each loop keeps its own position
+        assert np.array_equal(np.array(list(r)), ref)
+        pairs = list(zip(r, r))
+        assert len(pairs) == 40 and all(np.array_equal(a, b) for a, b in pairs)
+        count = 0
+        for a in r[:3]:
+            for b in r:
+                count += 1
+        assert count == 3 * 40
+        outer = [np.array_equal(a, ref[i]) for i, a in enumerate(r) if [b for b in r[:2]]]
+        assert all(outer) and len(outer) == 40
+
+def test_video_iteration_propagates_errors(tmp_path):
+    filename = tmp_path / 'err.mp4'
+    with VideoWriter(filename, fps=25) as writer:
+        writer.write_frames(_ramp_frames(5))
+    try:
+        for _ in VideoReader(filename, format='notaformat'):
+            pass
+        assert False, 'error was swallowed'
+    except ValueError:
+        pass
+
 def test_video_scan_notice(tmp_path, capsys, monkeypatch):
     """ A one-line notice is printed when a large file is scanned to build a frame index. """
     import daio.video

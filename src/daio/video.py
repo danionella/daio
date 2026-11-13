@@ -380,39 +380,68 @@ class VideoReader:
     def __del__(self):
         self.close()
         
+    def _frame_indices(self, index):
+        ''' Frame indices selected by a slice, or by a list/array of integers. '''
+        if isinstance(index, slice):
+            n = self.nframes
+            if not n:
+                if index.start is None or index.stop is None or index.start < 0 or index.stop < 0 or (index.step or 1) < 0:
+                    raise IndexError('open-ended or negative slices need a known frame count')
+                return range(index.start, index.stop, index.step or 1)
+            return range(*index.indices(n))
+        indices = np.asarray(index)
+        if indices.dtype == bool or not np.issubdtype(indices.dtype, np.integer) or indices.ndim != 1:
+            raise IndexError(f'frames can be indexed with integers, slices or 1-d integer arrays, not {index!r}')
+        return [int(i) for i in indices]
+
+    def _stack(self, frames):
+        if frames:
+            return np.array(frames)
+        try:
+            return np.empty((0, *self.shape[1:]), dtype=self.dtype)
+        except NotImplementedError:
+            return np.empty((0,), dtype=self.dtype)
+
     def __getitem__(self, index):
         if isinstance(index, (int, np.integer)):  # single frame
             return self.read_frame(index)
-        elif isinstance(index, slice):
-            frames = [self.__getitem__(i) for i in np.r_[index]]
+        if isinstance(index, tuple):
+            first, rest = index[0], index[1:]
+            if isinstance(first, (int, np.integer)):
+                return self.read_frame(first)[rest]
+            frames = [self.read_frame(i)[rest] for i in self._frame_indices(first)]
+            if not frames:
+                return self._stack([])[(slice(None), *rest)]
             return np.array(frames)
-        elif isinstance(index, tuple):
-            frames = [self.__getitem__(i)[index[1:]] for i in np.r_[index[0]]]
-            if len(frames) == 1:
-                return frames[0]
-            else:
-                return np.array(frames)
-        else:
-            raise NotImplementedError(f"slicing of {type(index)} : {index} not implemented yet")
-    
+        return self._stack([self.read_frame(i) for i in self._frame_indices(index)])
+
+    def __len__(self):
+        return self.nframes
+
     def __enter__(self):
         return self
-    
+
     def __exit__(self, exc_type, exc_value, traceback):
         self.close()
         return False
-    
+
     def __iter__(self):
-        self.rewind()
-        return self
-    
+        ''' Iterate over all frames. Each loop keeps its own position, so nested loops or zip(reader, reader) work. '''
+        i = 0
+        while not self.nframes or i < self.nframes:
+            try:
+                frame = self.read_frame(i)
+            except IndexError:
+                if self.nframes: # end of video reached early (e.g. damaged file)
+                    warnings.warn(f'{self.filename}: video ended after {i} frames, expected {self.nframes}.', stacklevel=2)
+                return
+            yield frame
+            i += 1
+
     def __next__(self):
-        try:
-            return self.read()
-        except:
-            self.rewind()
-            raise StopIteration
-    
+        ''' Read the next frame (same as read()). '''
+        return self.read()
+
     @property
     def frame_shape(self):
         ''' Return the shape of the video frames. '''

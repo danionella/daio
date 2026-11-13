@@ -12,8 +12,8 @@ authors = [
 license = {text = "MIT"}
 readme = "README.md"
 keywords = ["python", "HDF5", "data IO", "video IO"]
-requires-python = ">=3.8"
-dependencies = ["numpy","av","h5py","hdf5plugin"]
+requires-python = ">=3.10"
+dependencies = ["numpy","av>=17","h5py","hdf5plugin"]
 
 [project.urls]
 Homepage = "https://github.com/danionella/daio"

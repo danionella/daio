@@ -24,6 +24,43 @@ def test_video(tmp_path):
         for frame in reader:
             frame.mean()
 
+def _write_video_with_gaps(filename, container_ext):
+    """ Write a video with missing frames (irregular time stamps), as produced by cameras that drop frames. """
+    n = 120
+    pts = [i for i in range(n) if not (40 <= i < 45) and i % 17 != 0] # drop a block of frames and every 17th frame
+    with VideoWriter(filename, fps=25, gop_size='12') as writer:
+        for p in pts:
+            frame = np.full((64, 96), (p * 2) % 256, dtype='uint8') # brightness encodes the original frame number
+            writer.write(frame, pts=p)
+    return pts
+
+def test_video_irregular_timestamps(tmp_path):
+    """ The i-th frame obtained by seeking must equal the i-th frame obtained by sequential reading. """
+    for ext in ['mp4', 'mkv']:
+        filename = tmp_path / f'test_video_gaps.{ext}'
+        pts = _write_video_with_gaps(filename, ext)
+        sequential = list(VideoReader(filename))
+        assert len(sequential) == len(pts)
+        for index in ['auto', 'scan']:
+            with VideoReader(filename, index=index) as reader:
+                assert reader.has_index
+                assert reader.nframes == len(pts)
+                assert len(reader.frame_times) == len(pts)
+                rng = np.random.default_rng(0)
+                for i in list(rng.integers(0, len(pts), 30)) + [len(pts) - 1, 3, 4, 5, -1]:
+                    assert np.array_equal(reader[int(i)], sequential[i]), f'{ext}, index={index}, frame {i}'
+
+def test_video_cfr_uses_nominal_rate(tmp_path):
+    filename = tmp_path / 'test_video_cfr.mp4'
+    with VideoWriter(filename, fps=25) as writer:
+        for i in range(50):
+            writer.write(np.full((64, 96), i * 4, dtype='uint8'))
+    sequential = list(VideoReader(filename))
+    with VideoReader(filename) as reader:
+        assert not reader.has_index # no file scan needed for constant frame rate mp4
+        for i in [30, 10, 49, 11, 12, 0, 25]:
+            assert np.array_equal(reader[i], sequential[i])
+
 def test_hdf5(tmp_path):
     data = {
         'a': 1,

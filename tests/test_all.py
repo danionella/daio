@@ -362,3 +362,154 @@ def test_hdf5_numpy_to_native(tmp_path):
     data2 = load_from_h5(filename)
     assert data2['a'] == 1.5 and data2['b']['c'] == 3
     assert np.array_equal(data2['d'], [1., 2.]) and np.array_equal(data2['e'], np.arange(3))
+
+
+def test_lazyh5_subgroup_writes(tmp_path):
+    """ Nested dicts and serialized items can be written into subgroups (h5path handling). """
+    filename = tmp_path / 'subgroups.h5'
+    h5 = lazyh5(filename)
+    h5['c'] = {}
+    h5['c']['e'] = [2, 3, 4]
+    h5['c']['x'] = {'y': 1}
+    h5['c']['n'] = None
+    h5['c']['j'] = [1, None]
+    h5['c']['x']['z'] = {'deep': 'value'}
+    loaded = lazyh5(filename).to_dict()
+    assert loaded['c']['x']['y'] == 1 and loaded['c']['x']['z']['deep'] == 'value'
+    assert loaded['c']['n'] is None and loaded['c']['j'] == [1, None]
+    assert np.array_equal(loaded['c']['e'], [2, 3, 4])
+    sub = lazyh5(filename)['c'].to_dict()
+    assert sub['x'] == {'y': 1, 'z': {'deep': 'value'}} and sub['n'] is None and sub['j'] == [1, None]
+
+
+def test_h5path_without_trailing_slash(tmp_path):
+    filename = tmp_path / 'h5path.h5'
+    save_to_h5(filename, {'g': {'sub': {'x': 1}, 'j': None}}, verbosity=0)
+    for path in ['/g', 'g', '/g/', 'g/']:
+        assert load_from_h5(filename, h5path=path) == {'j': None, 'sub': {'x': 1}}
+    save_to_h5(filename, {'new': {'z': 1}, 'n': None}, h5path='/g', file_mode='a', verbosity=0)
+    save_to_h5(filename, {'z': 2}, h5path='/newgrp/sub', file_mode='a', verbosity=0) # group is created
+    loaded = load_from_h5(filename)
+    assert loaded['g']['new']['z'] == 1 and loaded['g']['n'] is None and loaded['newgrp']['sub']['z'] == 2
+
+
+def test_lazyh5_getitem_decodes_serialized_items(tmp_path):
+    """ lazyh5[key] returns the same values as load_from_h5 (not raw JSON bytes). """
+    filename = tmp_path / 'serialized.h5'
+    data = {'none': None, 'lst': [1, None], 'bools': [True, False], 'd': {'k': [{'a': 1}]}}
+    save_to_h5(filename, data, verbosity=0)
+    h5 = lazyh5(filename)
+    assert h5['none'] is None and h5['lst'] == [1, None] and h5['bools'] == [True, False]
+    assert h5['d']['k'] == [{'a': 1}] and h5.d.k == [{'a': 1}]
+
+
+def test_save_to_h5_failure_does_not_destroy_file(tmp_path):
+    """ Unsupported items raise before the file is opened, so an existing file is not truncated. """
+    import pytest
+    filename = tmp_path / 'precious.h5'
+    save_to_h5(filename, {'precious': np.arange(10)}, verbosity=0)
+    with pytest.raises(TypeError, match='/b/c'):
+        save_to_h5(filename, {'a': 1, 'b': {'c': {1, 2}}}, verbosity=0) # a set is not JSON serializable
+    assert np.array_equal(load_from_h5(filename)['precious'], np.arange(10))
+    with pytest.raises(ValueError, match='already exists'): # append mode: existing keys are checked before writing
+        save_to_h5(filename, {'new': 1, 'precious': 2}, file_mode='a', verbosity=0)
+    assert list(load_from_h5(filename)) == ['precious']
+
+
+def test_lazyh5_overwrite_keeps_old_data_on_failure(tmp_path, monkeypatch):
+    import pytest
+    import daio.h5
+    filename = tmp_path / 'overwrite.h5'
+    h5 = lazyh5(filename)
+    h5['x'] = np.arange(5)
+    with pytest.raises(TypeError):
+        h5.from_dict({'x': {1, 2}}, overwrite=True) # cannot be encoded: nothing is changed
+    assert np.array_equal(h5['x'], np.arange(5))
+    original = daio.h5._write_node
+    def failing_write_node(group, key, node):
+        original(group, key, node)
+        raise OSError('simulated write error')
+    monkeypatch.setattr(daio.h5, '_write_node', failing_write_node)
+    with pytest.raises(OSError):
+        h5.from_dict({'x': np.zeros(3)}, overwrite=True) # fails while writing: old data is kept
+    monkeypatch.undo()
+    assert np.array_equal(h5['x'], np.arange(5)) and h5.keys() == ['x']
+    h5.from_dict({'x': 'new'}, overwrite=True)
+    assert h5['x'] == 'new' and h5.keys() == ['x']
+    with pytest.raises(ValueError, match='already exists'):
+        h5['x'] = 1
+    with pytest.raises(AttributeError): # backward compatible exception type
+        h5['x'] = 1
+
+
+def test_hdf5_dataframe(tmp_path):
+    import pytest
+    pd = pytest.importorskip('pandas')
+    filename = tmp_path / 'df.h5'
+    df = pd.DataFrame({'a': [1.5, 2.5], 'b': [3, 4]}, index=[10, 20])
+    save_to_h5(filename, {'df': df, 'g': {'df': df}}, verbosity=0)
+    for loaded in [load_from_h5(filename)['df'], lazyh5(filename)['g']['df']]:
+        assert loaded.index.tolist() == [10, 20]
+        assert np.array_equal(loaded['a'], df['a']) and np.array_equal(loaded['b'], df['b'])
+
+
+def test_hdf5_types_roundtrip(tmp_path):
+    """ Round trip of str, bytes, numpy scalars, complex, big ints and string/mixed lists and arrays. """
+    import warnings
+    filename = tmp_path / 'types.h5'
+    data = {
+        'bytes_ascii': b'abc', # stored as an HDF5 string (loads as str, as before)
+        'bytes_binary': b'\xff\x00\x01',
+        'str_nul': 'a\x00b',
+        'np_float32': np.float32(1.5),
+        'np_int32': np.int32(3),
+        'np_bool': np.bool_(True),
+        'complex': 1 + 2j,
+        'bigint': 2**70,
+        'U_array': np.array(['a', 'bc']),
+        'str_list': [np.str_('a'), 'bc'],
+        'mixed_list': [1, 'a'], # must not be converted to ['1', 'a']
+        'arrays_list': [np.zeros(2), np.ones(3)],
+        'zero_d': np.array(5),
+    }
+    with warnings.catch_warnings():
+        warnings.simplefilter('error') # no (misleading) compression warnings
+        save_to_h5(filename, data, compression='gzip', verbosity=0)
+    loaded = load_from_h5(filename)
+    assert loaded['bytes_ascii'] == 'abc'
+    assert loaded['bytes_binary'] == b'\xff\x00\x01'
+    assert loaded['str_nul'] == 'a\x00b'
+    for key in ['np_float32', 'np_int32', 'np_bool']:
+        assert loaded[key] == data[key] and loaded[key].dtype == data[key].dtype
+    assert loaded['complex'] == 1 + 2j and loaded['bigint'] == 2**70
+    assert list(loaded['U_array']) == ['a', 'bc'] and list(loaded['str_list']) == ['a', 'bc']
+    assert loaded['mixed_list'] == [1, 'a']
+    assert loaded['arrays_list'] == [[0, 0], [1, 1, 1]]
+    assert loaded['zero_d'] == 5
+    import pytest
+    with pytest.raises(TypeError, match='keys must be strings'):
+        save_to_h5(filename, {1: 'a'}, verbosity=0)
+
+
+def test_hdf5_reads_binary_bytes_from_old_files(tmp_path):
+    """ Non-ASCII bytes stored as HDF5 strings (by earlier versions) load as bytes instead of raising. """
+    import h5py
+    filename = tmp_path / 'old.h5'
+    with h5py.File(filename, 'w') as f:
+        f.create_dataset('b', data=b'\xff\x01')
+    assert load_from_h5(filename)['b'] == b'\xff\x01'
+
+
+def test_lazyh5_robustness(tmp_path):
+    import copy, pickle, pytest
+    filename = tmp_path / 'robust.h5'
+    h5 = lazyh5(filename) # file does not exist yet
+    assert len(h5) == 0 and h5.keys() == [] and 'items' in repr(h5)
+    assert not hasattr(h5, 'missing')
+    h5['a'] = 1
+    assert copy.copy(h5)['a'] == 1 and pickle.loads(pickle.dumps(h5))['a'] == 1
+    assert {'a', 'to_dict', 'from_dict', 'keys'} <= set(dir(h5))
+    with pytest.raises(ValueError):
+        lazyh5(filename, readonly=True, erase_existing=True)
+    assert filename.exists()
+    assert 'FileNotFoundError' in repr(lazyh5(tmp_path / 'missing.h5', readonly=True)) # repr does not raise

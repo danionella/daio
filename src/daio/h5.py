@@ -1,4 +1,4 @@
-import warnings, os
+import warnings, os, io, posixpath, uuid
 from os.path import expanduser, isfile, exists
 
 import json
@@ -9,8 +9,17 @@ import hdf5plugin
 #TODO: test defaulting to hdf5plugin.Zstd compression for json-serialized strings
 
 
+class KeyExistsError(ValueError, AttributeError):
+    """ Raised when writing a key that already exists in the HDF5 file (and overwriting is not enabled).
+
+    Subclasses ValueError and, for backward compatibility with earlier versions of `lazyh5`, AttributeError. """
+
+
 def save_to_h5(filename, data, serialize=True, compression=None, json_compression='gzip', verbosity=1, file_mode='w', convert_numpy_to_native=False, h5path='/'):
-    ''' Save a nested dictionary data structure to an HDF5 file. 
+    """ Save a nested dictionary data structure to an HDF5 file. 
+
+    All items are checked and encoded before the file is opened, so unsupported items raise an error without
+    truncating or modifying the file.
 
     Args:
         filename (string): file name of the HDF5 file
@@ -20,88 +29,243 @@ def save_to_h5(filename, data, serialize=True, compression=None, json_compressio
         json_compression (string): h5py compression type for serialized JSON (default: 'gzip')
         file_mode (string): h5py.File access mode. 'w' (default) for create/detete and 'a' for create/append
         convert_numpy_to_native (boolean): convert numpy types to native python types
-        h5path (string): path within the HDF5 file to save the data
+        h5path (string): path within the HDF5 file to save the data (created if it does not exist)
 
     based on https://github.com/danionella/lib2p/blob/master/lib2putils.py
-    '''
-    if compression == 'zstd':
-        compression = hdf5plugin.Zstd()
-    if json_compression == 'zstd':
-        json_compression = hdf5plugin.Zstd()
-    def recursively_save_contents_to_group(h5file, path, data_item):
-        assert isinstance(data_item, (dict))
-        for key, item in data_item.items():
-            if verbosity > 1:
-                print('saving entry: {} -- {}'.format(path + key, type(item)))
-            if isinstance(item, (np.ndarray, np.int64, np.float64, str, bytes, int, float)) or is_h5py_compatible_array(item):
-                comp = None if np.isscalar(item) else compression
-                try:
-                    h5file[path].create_dataset(key, data=item, compression=comp)
-                except TypeError:
-                    warnings.warn(f'\n\nkey: {key} -- Saving data with compression failed. Saving without compression.\n')
-                    h5file[path].create_dataset(key, data=item, compression=None)
-            elif type(item).__name__ == 'DataFrame':
-                json_bytes = np.frombuffer(item.to_json().encode('utf-8'), dtype='byte')
-                h5file[path].create_dataset(key, data=json_bytes, compression=json_compression)
-                h5file[path + key].attrs['pandas_json_type'] = f'This {type(item)} was JSON serialized and UTF-8 encoded.'
-            elif isinstance(item, dict):
-                h5file[path].create_group(key)
-                recursively_save_contents_to_group(h5file, path + key + '/', item)
-            elif serialize:
-                if verbosity > 0:
-                    print(f'serializing {type(item)} at {path+key}', flush=True)
-                #TODO: test replacing json with orjson
-                encoder_default = lambda o: o.item() if isinstance(o, np.generic) else json.JSONEncoder().default(o)
-                json_bytes = json.dumps(item, default=encoder_default).encode('utf-8')
-                h5file[path].create_dataset(key, data=np.frombuffer(json_bytes, dtype='byte'), compression=json_compression)
-                h5file[path + key].attrs['json_type'] = f'This {type(item)} was JSON serialized and UTF-8 encoded.'
-            else:
-                raise ValueError(f'Cannot save {type(item)} to {path+key}. Consider enabling serialisation.')
+    """
+    _save(filename, data, serialize=serialize, compression=compression, json_compression=json_compression,
+          verbosity=verbosity, file_mode=file_mode, convert_numpy_to_native=convert_numpy_to_native, h5path=h5path)
 
+
+def _save(filename, data, serialize=True, compression=None, json_compression='gzip', verbosity=1, file_mode='w',
+          convert_numpy_to_native=False, h5path='/', overwrite=False):
+    opts = dict(serialize=serialize, verbosity=verbosity, compression=_compression_filter(compression),
+                json_compression=_compression_filter(json_compression))
     if convert_numpy_to_native:
         data = _numpy_to_native(data)
-
-    filename = expanduser(filename)
-    with h5py.File(filename, file_mode) as h5file:
-        recursively_save_contents_to_group(h5file, h5path, data)
+    h5path = _normalize_h5path(h5path)
+    # encode everything first: errors are raised before the file is opened (with mode 'w': truncated)
+    prepared = _prepare_group(data, h5path, opts)
+    with h5py.File(expanduser(filename), file_mode) as h5file:
+        _write_items(h5file.require_group(h5path), prepared, overwrite=overwrite)
 
 
 def load_from_h5(filename, h5path='/'):
-    ''' Load an HDF5 file to a dictionary
+    """ Load an HDF5 file to a dictionary
     
     Args:
         filename (string): file name of the HDF5 file
+        h5path (string): path of the HDF5 group to load (default: '/')
         
     Returns:
         dict: file contents
-    '''
-
-    def recursively_load_contents_from_group(h5file, path):
-        ans = dict()
-        for key, item in h5file[path].items():
-            if 'pandas_type' in item.attrs.keys():
-                import pandas as pd
-                ans[key] = pd.read_hdf(filename, path + key)
-            elif 'pandas_json_type' in item.attrs.keys():
-                import pandas as pd
-                json_str = item[()].tobytes().decode('utf-8')
-                ans[key] = pd.read_json(json_str)
-            elif 'json_type' in item.attrs.keys():
-                #TODO: test replacing json with orjson
-                ans[key] = json.loads(item[()].tobytes())
-            elif isinstance(item, h5py._hl.dataset.Dataset):
-                if h5py.check_string_dtype(item.dtype) is not None:
-                    item = item.asstr()
-                ans[key] = item[()]
-            elif isinstance(item, h5py._hl.group.Group):
-                ans[key] = recursively_load_contents_from_group(h5file, path + key + '/')
-            else:
-                raise ValueError(f"I don't know what to do about {path+key}.")
-        return ans
-
+    """
     filename = expanduser(filename)
     with h5py.File(filename, 'r') as h5file:
-        return recursively_load_contents_from_group(h5file, h5path)
+        return _read_group(h5file[_normalize_h5path(h5path)], filename)
+
+
+def _normalize_h5path(h5path):
+    """ Return an absolute HDF5 path without trailing (or repeated) slashes, e.g. 'a//b/' -> '/a/b'. """
+    return '/' + '/'.join(part for part in str(h5path).split('/') if part)
+
+
+def _compression_filter(compression):
+    if isinstance(compression, str) and compression.lower() == 'zstd':
+        return hdf5plugin.Zstd()
+    return compression
+
+
+def _h5_supports_dtype(dtype):
+    try:
+        h5py.h5t.py_create(dtype, logical=True)
+        return True
+    except TypeError:
+        return False
+
+
+def _all_str(arr):
+    """ Whether all elements of an object array are str without NUL characters (which HDF5 strings cannot hold). """
+    return all(isinstance(x, str) and '\x00' not in x for x in arr.flat)
+
+
+def _json_default(o):
+    if isinstance(o, np.generic):
+        return o.item()
+    if isinstance(o, np.ndarray):
+        return o.tolist()
+    raise TypeError(f'Object of type {type(o).__name__} is not JSON serializable')
+
+
+def _list_to_array(obj):
+    """ Convert a list or tuple to an array that h5py can store, or return None (the list is then JSON serialized).
+    Numeric lists become numeric arrays and lists of str become string arrays. Mixed lists (e.g. [1, 'a'], which
+    numpy would convert to strings), bool lists, ragged lists and lists with None are left to JSON serialization. """
+    try:
+        arr = np.asarray(obj)
+    except (ValueError, TypeError):
+        return None
+    if arr.dtype.kind in 'iufc':
+        return arr
+    if arr.dtype.kind == 'U' and _all_str(np.asarray(obj, dtype=object)):
+        return arr.astype(object)
+    if arr.dtype.kind == 'S' and all(isinstance(x, bytes) for x in np.asarray(obj, dtype=object).flat):
+        return arr
+    return None
+
+
+def _native(item):
+    """ Return (data, dtype, attrs) for items stored as native HDF5 datasets, or None for items to be JSON serialized. """
+    if isinstance(item, str):
+        if '\x00' in item:
+            return None # HDF5 strings cannot hold NUL characters
+        return str(item), None, {}
+    if isinstance(item, bytes):
+        if b'\x00' in item or not item.isascii():
+            # binary data: store as opaque bytes (HDF5 strings cannot hold NUL characters or non-text bytes)
+            return np.void(bytes(item)), None, {'bytes_type': 'Raw bytes stored as an opaque HDF5 scalar.'}
+        return bytes(item), None, {}
+    if isinstance(item, bool):
+        return item, None, {}
+    if isinstance(item, int):
+        if -2**63 <= item < 2**64:
+            return item, None, {}
+        return None # out of HDF5 integer range
+    if isinstance(item, (float, complex)):
+        return item, None, {}
+    if isinstance(item, np.generic):
+        if item.dtype.kind in 'biufc' and _h5_supports_dtype(item.dtype):
+            return item, None, {}
+        return None
+    if isinstance(item, np.ndarray):
+        if item.dtype.kind == 'U' or (item.dtype.kind == 'O' and _all_str(item)):
+            return item.astype(object), h5py.string_dtype(), {}
+        if item.dtype.kind == 'O':
+            return None
+        return item, None, {}
+    if isinstance(item, (list, tuple)):
+        arr = _list_to_array(item)
+        if arr is None:
+            return None
+        return arr, (h5py.string_dtype() if arr.dtype.kind == 'O' else None), {}
+    return None
+
+
+def _prepare_group(data, path, opts):
+    """ Encode a (nested) dict into ('group', {key: node}) nodes, raising errors for items that cannot be saved. """
+    if not isinstance(data, dict):
+        raise TypeError(f'Expected a dict to save at {path}, got {type(data)}.')
+    out = {}
+    for key, item in data.items():
+        if not isinstance(key, str):
+            raise TypeError(f'Cannot save key {key!r} in {path}: keys must be strings.')
+        out[key] = _prepare_item(item, posixpath.join(path, key), opts)
+    return ('group', out)
+
+
+def _prepare_item(item, path, opts):
+    if opts['verbosity'] > 1:
+        print('saving entry: {} -- {}'.format(path, type(item)))
+    if isinstance(item, dict):
+        return _prepare_group(item, path, opts)
+    if type(item).__name__ == 'DataFrame':
+        json_bytes = np.frombuffer(item.to_json().encode('utf-8'), dtype='byte')
+        attrs = {'pandas_json_type': f'This {type(item)} was JSON serialized and UTF-8 encoded.'}
+        return ('dataset', json_bytes, None, opts['json_compression'], attrs)
+    native = _native(item)
+    if native is not None:
+        data, dtype, attrs = native
+        if dtype is None and isinstance(data, np.ndarray) and not _h5_supports_dtype(data.dtype):
+            raise TypeError(f'Cannot save array of dtype {data.dtype} at {path}: no HDF5 equivalent.')
+        compression = None if np.ndim(data) == 0 else opts['compression']
+        return ('dataset', data, dtype, compression, attrs)
+    if not opts['serialize']:
+        raise ValueError(f'Cannot save {type(item)} to {path}. Consider enabling serialisation.')
+    if opts['verbosity'] > 0:
+        print(f'serializing {type(item)} at {path}', flush=True)
+    #TODO: test replacing json with orjson
+    try:
+        json_bytes = json.dumps(item, default=_json_default).encode('utf-8')
+    except (TypeError, ValueError) as e:
+        raise TypeError(f'Cannot save {type(item)} at {path}: {e}') from e
+    attrs = {'json_type': f'This {type(item)} was JSON serialized and UTF-8 encoded.'}
+    return ('dataset', np.frombuffer(json_bytes, dtype='byte'), None, opts['json_compression'], attrs)
+
+
+def _write_node(group, key, node):
+    if node[0] == 'group':
+        subgroup = group.create_group(key)
+        for k, n in node[1].items():
+            _write_node(subgroup, k, n)
+        return
+    _, data, dtype, compression, attrs = node
+    try:
+        dataset = group.create_dataset(key, data=data, dtype=dtype, compression=compression)
+    except TypeError:
+        if compression is None:
+            raise
+        if key in group:
+            del group[key]
+        warnings.warn(f'{posixpath.join(group.name, key)}: compression is not supported for this item. Saving without compression.', stacklevel=4)
+        dataset = group.create_dataset(key, data=data, dtype=dtype)
+    for k, v in attrs.items():
+        dataset.attrs[k] = v
+
+
+def _write_items(group, prepared, overwrite=False):
+    """ Write prepared items into group. Existing keys raise KeyExistsError (before anything is written), or are
+    replaced if overwrite is True: the new item is written under a temporary name first, so that the old item is
+    only removed once the new one was written successfully. """
+    items = prepared[1]
+    existing = [key for key in items if key in group]
+    if existing and not overwrite:
+        raise KeyExistsError(f"Dataset or group {', '.join(repr(k) for k in existing)} already exists in '{group.name}'!")
+    for key, node in items.items():
+        if key not in group:
+            _write_node(group, key, node)
+            continue
+        tmp = f'__daio_tmp_{uuid.uuid4().hex}'
+        try:
+            _write_node(group, tmp, node)
+        except BaseException:
+            if tmp in group:
+                del group[tmp]
+            raise
+        del group[key]
+        group.move(tmp, key)
+
+
+def _read_dataset(item):
+    """ Read a dataset, decoding items that save_to_h5 serialized. """
+    if 'pandas_json_type' in item.attrs:
+        import pandas as pd
+        return pd.read_json(io.StringIO(item[()].tobytes().decode('utf-8')))
+    if 'json_type' in item.attrs:
+        #TODO: test replacing json with orjson
+        return json.loads(item[()].tobytes())
+    if 'bytes_type' in item.attrs:
+        return item[()].tobytes()
+    if h5py.check_string_dtype(item.dtype) is not None:
+        try:
+            return item.asstr()[()]
+        except UnicodeDecodeError: # not text (e.g. binary bytes saved by earlier versions): return raw bytes
+            return item[()]
+    return item[()]
+
+
+def _read_item(item, filename):
+    if 'pandas_type' in item.attrs:
+        import pandas as pd
+        return pd.read_hdf(filename, item.name)
+    if isinstance(item, h5py.Dataset):
+        return _read_dataset(item)
+    if isinstance(item, h5py.Group):
+        return _read_group(item, filename)
+    raise ValueError(f"I don't know what to do about {item.name}.")
+
+
+def _read_group(group, filename):
+    return {key: _read_item(item, filename) for key, item in group.items()}
     
 
 class lazyh5:
@@ -118,8 +282,10 @@ class lazyh5:
     """
 
     def __init__(self, filepath, h5path='/', readonly=None, erase_existing=False):
+        if erase_existing and readonly:
+            raise ValueError('erase_existing=True cannot be combined with readonly=True.')
         self._filepath = filepath
-        self._h5path = h5path
+        self._h5path = _normalize_h5path(h5path)
         if erase_existing and isfile(filepath):
             os.remove(filepath)
         if readonly is None:
@@ -130,8 +296,10 @@ class lazyh5:
         """Lists the keys of the current HDF5 group.
 
         Returns:
-            list: List of keys in the current HDF5 group.
+            list: List of keys in the current HDF5 group (empty if a writable file has not been created yet).
         """
+        if not self._readonly and not exists(self._filepath):
+            return []
         with h5py.File(self._filepath, 'r') as f:
             out = list(f[self._h5path].keys())
         return out
@@ -142,25 +310,24 @@ class lazyh5:
         Returns:
             dict: A dictionary representation of the HDF5 file.
         """
-        return load_from_h5(self._filepath, h5path=self._h5path+'/')
+        return load_from_h5(self._filepath, h5path=self._h5path)
     
-    def from_dict(self, data, compression=None, json_compression='gzip', overwrite=False):
+    def from_dict(self, data, compression=None, json_compression='gzip', overwrite=False, verbosity=1):
         """Writes a dictionary to the HDF5 file or group.
 
         Args:
             data (dict): A dictionary to write to the HDF5 file (if readonly is False).
+            compression (string): h5py compression type (e.g. 'gzip', 'lzf', 'zstd' or None)
+            json_compression (string): h5py compression type for serialized JSON (default: 'gzip')
+            overwrite (bool): replace existing keys. Otherwise, existing keys raise a KeyExistsError (a subclass of
+                ValueError and AttributeError) and nothing is written. Existing items are only removed once their
+                replacement has been written.
+            verbosity (int): 0: silent, 1: print a note for serialized items, 2: print every item
         """
         if self._readonly:
             raise ValueError("Cannot add data to a read-only lazyh5 object.")
-        if exists(self._filepath):
-            with h5py.File(self._filepath, 'a') as f:
-                for k, v in data.items():
-                    if (self._h5path+'/'+k in f):
-                        if overwrite:
-                            del f[self._h5path][k]
-                        else:
-                            raise AttributeError(f"Dataset or group '{k}' already exists!")
-        save_to_h5(self._filepath, data, h5path=self._h5path, file_mode='a', compression=compression, json_compression=json_compression)
+        _save(self._filepath, data, h5path=self._h5path, file_mode='a', compression=compression,
+              json_compression=json_compression, overwrite=overwrite, verbosity=verbosity)
         return self
 
     def remove_key(self, key):
@@ -180,15 +347,14 @@ class lazyh5:
                         raise KeyError(f"Key '{key}' not found in HDF5 file.")
 
     def __getitem__(self, key):
-        """Gets an item by key."""
+        """Gets an item by key. Groups are returned as lazyh5 objects, datasets are read (and decoded, like in
+        load_from_h5)."""
         with h5py.File(self._filepath, 'r') as f:
             item = f[self._h5path][key]
-            if isinstance(item, h5py.Group):
-                return lazyh5(self._filepath, h5path=f"{self._h5path}/{key}".lstrip('/'), readonly=self._readonly)
-            elif isinstance(item, h5py.Dataset):
-                if h5py.check_string_dtype(item.dtype) is not None:
-                    item = item.asstr()
-                return item[()]
+            if isinstance(item, h5py.Group) and 'pandas_type' not in item.attrs:
+                return lazyh5(self._filepath, h5path=posixpath.join(self._h5path, key), readonly=self._readonly)
+            elif isinstance(item, (h5py.Group, h5py.Dataset)):
+                return _read_item(item, self._filepath)
             else:
                 raise KeyError(f"Unknown item type for key: {key}")
             
@@ -198,10 +364,12 @@ class lazyh5:
 
     def __getattr__(self, key):
         """Provides dynamic attribute-style access."""
+        if key.startswith('_'): # private and special attributes (e.g. looked up by copy, pickle or IPython)
+            raise AttributeError(key)
         try:
             return self[key]
-        except KeyError:
-            raise AttributeError(key)
+        except (KeyError, FileNotFoundError):
+            raise AttributeError(key) from None
 
     def __setattr__(self, key, value):
         """Sets an attribute or creates a new dataset."""
@@ -217,7 +385,11 @@ class lazyh5:
 
     def __repr__(self):
         """Provides a string representation of the object."""
-        return f"<lazyh5 for file '{self._filepath}', HDF5 path '{self._h5path}' with {len(self)} items>"
+        try:
+            content = f'with {len(self)} items'
+        except (OSError, KeyError) as e:
+            content = f'({type(e).__name__})'
+        return f"<lazyh5 for file '{self._filepath}', HDF5 path '{self._h5path}' {content}>"
 
     def _ipython_key_completions_(self):
         """Enables key completions in IPython."""
@@ -225,7 +397,11 @@ class lazyh5:
 
     def __dir__(self):
         """Lists all accessible attributes and keys."""
-        return self.keys() + dir(super())
+        try:
+            keys = self.keys()
+        except (OSError, KeyError):
+            keys = []
+        return sorted(set(super().__dir__()) | set(keys))
     
     def inspect_structure(self, group=None, prefix=""):
         """Returns a dictionary with the hierarchical structure of the HDF5 file.
@@ -265,7 +441,7 @@ class lazyh5:
         
     def _ipython_display_(self):
         """Displays a summary of the object in IPython."""
-        from IPython.display import JSON
+        from IPython.display import JSON, display
         safe = json.loads(json.dumps(self.inspect_structure(), default=lambda o: o.item() if isinstance(o, np.generic) else str(o)))
         display(JSON(safe, root=self._filepath))
 
@@ -282,12 +458,5 @@ def _numpy_to_native(obj):
 
 
 def is_h5py_compatible_array(obj):
-    if isinstance(obj, (list, tuple)):
-        try:
-            # Ensure it can be converted to a numerical numpy array
-            arr = np.asarray(obj)
-            # Check if it is a numerical or string array (h5py supports these)
-            return np.issubdtype(arr.dtype, np.number) or arr.dtype.char in {'S', 'U'}
-        except (ValueError, TypeError):
-            return False
-    return False
+    """ Whether a list or tuple is saved as an HDF5 array (numeric lists and lists of str) rather than JSON. """
+    return isinstance(obj, (list, tuple)) and _list_to_array(obj) is not None

@@ -145,6 +145,36 @@ def test_video_duplicate_timestamps_fall_back_to_sequential(tmp_path):
     _remux(src, dup, pts_map=lambda t: t - step if (t // step) % 10 == 5 else t)
     _unreliable(dup)
 
+def test_video_intra_refresh_falls_back_to_sequential(tmp_path):
+    """ Intra refresh streams have no real key frames; frames decoded right after a seek are incomplete. """
+    filename = tmp_path / 'intra_refresh.mp4'
+    pattern = np.random.default_rng(0).integers(0, 255, (64, 192), dtype='uint8')
+    with VideoWriter(filename, fps=25, g='24', bf='0', **{'x264-params': 'intra-refresh=1:scenecut=0'}) as writer:
+        writer.write_frames([pattern[:, i:i + 96] for i in range(96)]) # smoothly moving texture
+    _unreliable(filename)
+
+def test_video_truncated_file_warns(tmp_path):
+    """ A truncated recording (e.g. crashed camera) contains a damaged last packet: warn about it. """
+    filename, truncated = tmp_path / 'full.avi', tmp_path / 'truncated.avi'
+    with VideoWriter(filename, codec='mjpeg', fps=25, pix_fmt='yuvj420p') as writer:
+        writer.write_frames(_ramp_frames(60))
+    data = filename.read_bytes()
+    truncated.write_bytes(data[:int(len(data) * 0.8)])
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter('always')
+        with VideoReader(truncated) as reader:
+            reference = []
+            with av.open(str(truncated)) as container: # reference: decodable frames only
+                for packet in container.demux(video=0):
+                    try:
+                        reference += [f.to_ndarray(format='gray') for f in packet.decode()]
+                    except av.InvalidDataError:
+                        pass
+            for i in [10, 3, len(reference) - 1, 20]:
+                assert np.array_equal(reader[i], reference[i])
+            assert sum(1 for _ in reader) == len(reference)
+    assert any('damaged' in str(w.message) for w in caught)
+
 def test_video_slicing_and_iteration(tmp_path):
     filename = tmp_path / 'slicing.mp4'
     with VideoWriter(filename, fps=25, g='12') as writer:

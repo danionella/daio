@@ -171,9 +171,11 @@ class VideoReader:
             print(f'daio: scanning {os.path.basename(self.filename)} ({size / 1e9:.1f} GB) to build a frame index...', flush=True)
         self.rewind()
         pts, pos, kf_pts, kf_seek = [], [], [], []
+        n_corrupt = 0
         for packet in self.container.demux(self.stream):
             if packet.size == 0 or packet.is_discard: # flush packets or samples discarded by edit lists
                 continue
+            n_corrupt += packet.is_corrupt
             ts = packet.pts if packet.pts is not None else packet.dts
             if ts is None:
                 raise ValueError('Video packets have no time stamps. Cannot build a frame index. Consider transcoding (ffmpeg -y -i "input.mp4" -c:v libx264 -pix_fmt yuv420p -preset superfast -crf 23 "output.mp4").')
@@ -182,6 +184,8 @@ class VideoReader:
             if packet.is_keyframe:
                 kf_pts.append(ts)
                 kf_seek.append(ts if packet.dts is None else min(ts, packet.dts))
+        if n_corrupt:
+            self._warn_damaged(f'{n_corrupt} damaged packet(s) found, e.g. a truncated recording')
         self._set_index(pts, kf_pts, kf_seek, source='scan', frame_pos=pos)
         self._calibrate()
         self.rewind()
@@ -211,6 +215,8 @@ class VideoReader:
     def read(self):
         ''' Read the next frame in the specified format. '''
         frame_obj = next(self.framegenerator)
+        if frame_obj.is_corrupt:
+            self._warn_damaged(f'frame {self._next_idx} is corrupt')
         if self.seekable and (frame_obj.pts is None or (self.last_pts is not None and frame_obj.pts <= self.last_pts)):
             self._set_unseekable('decoded time stamps are missing or not increasing')
         self.last_pts = frame_obj.pts
@@ -231,9 +237,25 @@ class VideoReader:
     def _decode(self):
         ''' Decode frames from the current position. Each frame carries its packet's file position and key frame flag
         (frame.opaque). '''
+        self._landing_packet = None # first packet after a seek: (pos, is_keyframe, is_discard)
         for packet in self.container.demux(self.stream):
             packet.opaque = (packet.pos, packet.is_keyframe)
-            yield from packet.decode()
+            if self._landing_packet is None and packet.size:
+                self._landing_packet = (packet.pos, packet.is_keyframe, packet.is_discard)
+            try:
+                frames = packet.decode()
+            except av.InvalidDataError:
+                if not packet.is_corrupt:
+                    raise
+                self._warn_damaged(f'undecodable damaged packet at byte {packet.pos} skipped')
+                continue
+            yield from frames
+
+    def _warn_damaged(self, detail):
+        if not getattr(self, '_warned_damaged', False):
+            self._warned_damaged = True
+            warnings.warn(f'{self.filename}: video contains damaged data ({detail}). Frames decoded from damaged data '
+                          'may differ depending on how they are reached (sequentially or by seeking).', stacklevel=3)
 
     def _set_unseekable(self, reason):
         if self.seekable:
@@ -300,8 +322,9 @@ class VideoReader:
             problem = None
             if frame_obj.pts is None:
                 problem = 'decoded frames have no time stamps'
-            elif frame_obj.opaque is not None and frame_obj.opaque[1] and not frame_obj.key_frame:
-                problem = 'key frames in the container are not decodable on their own (e.g. intra refresh)'
+            elif seek_ts is not None and not frame_obj.key_frame and not (self._landing_packet and self._landing_packet[2]):
+                # (unless the seek landed on a key frame that an edit list discards)
+                problem = 'decoding after a seek does not start at a key frame (e.g. intra refresh)'
             elif frame_obj.pts > target_pts + wiggle: # overshoot (seek landed after the target)
                 continue
             while problem is None and frame_obj.pts < target_pts - wiggle:
@@ -367,6 +390,8 @@ class VideoReader:
                 self.build_index()
                 return self._read_frame(frame_idx)
             warn_transcode(f'Seek problem with frame {frame_idx}! pts: {frame_obj.pts}; target: {target_pts}; dts: {frame_obj.dts}; pict_type: {str(frame_obj.pict_type)}')
+        if frame_obj.is_corrupt:
+            self._warn_damaged(f'frame {frame_idx} is corrupt')
         frame = frame_obj.to_ndarray(format=self.read_format)
         self.last_pts = frame_obj.pts
         self._next_idx = frame_idx + 1

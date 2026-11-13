@@ -185,6 +185,68 @@ def test_video_without_timestamps_is_read_sequentially(tmp_path):
         warnings.simplefilter('ignore')
         assert VideoReader(filename).nframes == 60
 
+def _write_leading_frames_without_timestamps(filename, n=60, n_negative=20):
+    """ mkv whose first frames have negative time stamps, which the muxer stores without time stamps. """
+    from fractions import Fraction
+    with av.open(str(filename), 'w', options={'avoid_negative_ts': 'disabled'}) as container:
+        stream = container.add_stream('libx264', rate=25, options={'g': '12'})
+        stream.width, stream.height, stream.pix_fmt = 96, 64, 'yuv420p'
+        for k in range(n):
+            frame = av.VideoFrame.from_ndarray(np.full((64, 96), (k * 4) % 256, np.uint8), format='gray')
+            frame.pts, frame.time_base = k - n_negative, Fraction(1, 25)
+            for packet in stream.encode(frame):
+                container.mux(packet)
+        for packet in stream.encode():
+            container.mux(packet)
+
+def test_video_leading_frames_without_timestamps(tmp_path):
+    """ Seeking to time stamp 0 skips such frames: they must still be counted and read. """
+    filename = tmp_path / 'leading.mkv'
+    _write_leading_frames_without_timestamps(filename)
+    reference = _decode_all(filename)
+    assert len(reference) == 60
+    _unreliable(filename)
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore')
+        reader = VideoReader(filename)
+        assert reader.nframes == 60 and sum(1 for _ in reader) == 60
+
+def test_video_file_objects(tmp_path):
+    """ File-like objects are rewound when the file is re-opened. """
+    import io
+    raw, leading = tmp_path / 'raw.h264', tmp_path / 'leading.mkv'
+    with VideoWriter(raw, fps=25, g='12') as writer:
+        writer.write_frames(_ramp_frames(60))
+    _write_leading_frames_without_timestamps(leading)
+    for filename in [raw, leading]:
+        reference = _decode_all(filename)
+        for source in [open(filename, 'rb'), io.BytesIO(filename.read_bytes())]:
+            with warnings.catch_warnings():
+                warnings.simplefilter('ignore')
+                with VideoReader(source) as reader:
+                    assert reader.nframes == len(reference)
+                    _check_random_access(reader, reference, n_random=10)
+            source.close()
+
+def test_video_raw_streams(tmp_path):
+    """ Raw streams: a raw H.264 stream cut mid-GOP (packets before the first key frame are not decoded) and raw
+    MJPEG (packets without file positions). """
+    src, cut = tmp_path / 'src.h264', tmp_path / 'cut.h264'
+    with VideoWriter(src, fps=25, g='12', **{'x264-params': 'repeat-headers=1'}) as writer:
+        writer.write_frames(_ramp_frames(60))
+    with av.open(str(src)) as container: # a raw stream is just its packets: drop the first ones (mid-GOP cut)
+        cut.write_bytes(b''.join(bytes(p) for k, p in enumerate(container.demux(video=0)) if k >= 5 and p.size))
+    mjpeg = tmp_path / 'raw.mjpeg'
+    with VideoWriter(mjpeg, codec='mjpeg', pix_fmt='yuvj420p', fps=25) as writer:
+        writer.write_frames(_ramp_frames(30))
+    for filename in [cut, mjpeg]:
+        reference = _decode_all(filename)
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore')
+            with VideoReader(filename) as reader:
+                assert reader.nframes == len(reference), filename.name
+                _check_random_access(reader, reference, n_random=10)
+
 def test_video_slicing_and_iteration(tmp_path):
     filename = tmp_path / 'slicing.mp4'
     with VideoWriter(filename, fps=25, g='12') as writer:

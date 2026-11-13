@@ -71,6 +71,8 @@ class VideoReader:
         ''' Open (or re-open) the file and configure the decoder. '''
         if hasattr(self, 'container'):
             self.container.close()
+        if hasattr(self.filename, 'seek'): # file-like object: (re)open from its start
+            self.filename.seek(0)
         self.container = av.open(self.filename)
         self.stream = self.container.streams.video[0]
         self.stream.codec_context.thread_count = self._thread_count
@@ -85,6 +87,9 @@ class VideoReader:
         ''' Whether seeking to 0 returns to the first packet in the file (not the case e.g. for files whose first
         frames have negative or no time stamps; the file is then re-opened to rewind). '''
         first = self._first_packet_pos()
+        if first is None or first < 0: # packet positions unknown: cannot check, re-open to rewind (always safe)
+            self._open()
+            return False
         try:
             self.container.seek(0)
             ok = self._first_packet_pos() == first
@@ -117,7 +122,7 @@ class VideoReader:
         # container index positions can differ from packet positions by a constant (e.g. avi chunk headers)
         self.rewind()
         first_packet = next((p for p in self.container.demux(self.stream) if p.size), None)
-        if first_packet is not None and first_packet.pos >= 0 and pos[0] >= 0:
+        if first_packet is not None and first_packet.pos is not None and first_packet.pos >= 0 and pos[0] >= 0:
             pos = pos + (first_packet.pos - pos[0])
         if self.stream.codec_context.has_b_frames == 0:
             # no frame reordering: decode time stamps are presentation time stamps
@@ -192,13 +197,16 @@ class VideoReader:
         self.rewind()
         pts, pos, kf_pts, kf_seek = [], [], [], []
         n_corrupt = 0
+        first_key = None # index of the first key packet
         for packet in self.container.demux(self.stream):
             if packet.size == 0 or packet.is_discard: # flush packets or samples discarded by edit lists
                 continue
             n_corrupt += packet.is_corrupt
             ts = packet.pts if packet.pts is not None else packet.dts
+            if packet.is_keyframe and first_key is None:
+                first_key = len(pts)
             pts.append(ts)
-            pos.append(packet.pos)
+            pos.append(packet.pos if packet.pos is not None else -1)
             if packet.is_keyframe:
                 kf_pts.append(ts)
                 kf_seek.append(ts if packet.dts is None else min(ts, packet.dts))
@@ -206,7 +214,7 @@ class VideoReader:
             self._warn_damaged(f'{n_corrupt} damaged packet(s) found, e.g. a truncated recording')
         if any(ts is None for ts in pts): # no frame index possible: count frames, decode sequentially
             self._frame_pts = self._frame_pos = None
-            self._nframes_counted = len(pts)
+            self._nframes_counted = len(pts) - (first_key or 0) # (packets before the first key frame are not decoded)
             self.index_source = 'scan'
             self._set_unseekable('some frames have no time stamps')
             self.rewind()
@@ -227,7 +235,8 @@ class VideoReader:
 
     @property
     def frame_pts(self):
-        ''' Presentation time stamps of all frames (in units of stream.time_base). '''
+        ''' Presentation time stamps of all frames (in units of stream.time_base). Without a frame index (nominal frame
+        rate, or files without time stamps), these are computed from the nominal frame rate. '''
         if self._frame_pts is not None:
             return self._frame_pts.copy()
         return np.array([self._frame_to_pts(i) for i in range(self.nframes)], dtype=np.int64)
@@ -350,7 +359,8 @@ class VideoReader:
             problem = None
             if frame_obj.pts is None:
                 problem = 'decoded frames have no time stamps'
-            elif (seek_ts is not None and not frame_obj.key_frame and frame_obj.pict_type != av.video.frame.PictureType.I
+            elif (seek_ts is not None and not frame_obj.key_frame
+                  and not (frame_obj.pict_type == av.video.frame.PictureType.I and self._landing_packet and self._landing_packet[1])
                   and not (self._landing_packet and self._landing_packet[2])): # (edit lists may discard the key frame)
                 if self._landing_packet and not self._landing_packet[1]:
                     continue # the seek landed on a non-key frame (e.g. mpeg-ts): seek further back
@@ -399,6 +409,8 @@ class VideoReader:
         try:
             return self._read_frame(frame_idx)
         except StopIteration:
+            if self._frame_pts is None and getattr(self, '_nframes_counted', None) is not None and self._next_idx < self._nframes_counted:
+                self._nframes_counted = self._next_idx # frame count without index: the video ended earlier
             self.rewind()
             raise IndexError(f'frame index {frame_idx} out of range') from None
 

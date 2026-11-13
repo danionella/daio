@@ -44,12 +44,9 @@ jobs:
         run: |
           conda activate tests
           conda install pytest
-          pip install -e .
+          pip install -e ".[pandas]"
 
-      # this runs the platform-specific tests declared in tox.ini
       - name: Test with pytest
         run: |
           conda activate tests
           pytest tests/
-        env:
-          PLATFORM: ${{ matrix.platform }}

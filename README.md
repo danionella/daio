@@ -67,6 +67,12 @@ with VideoReader('/path/to/video.mp4') as reader:
     frame_7 = reader[7]
 ```
 
+> [!TIP]
+> **Recommended format for fast, reliable reading:** H.264 in MP4, without B-frames:
+> `ffmpeg -i input.avi -c:v libx264 -crf 18 -bf 0 -g 50 -pix_fmt yuv420p output.mp4`
+> (with daio: `VideoWriter('output.mp4', fps=25, crf=18, bf=0, g=50)`).
+> MP4 files open instantly (MKV/TS files are scanned once on opening), and without B-frames each frame is located directly from the file's index. The keyframe interval (`-g`) trades random-seek speed for file size: shorter intervals seek faster and cost little for moving or noisy footage, but can multiply the size of nearly static footage (which seeks fast anyway). AVI files with B-frames and intra-refresh streams make `VideoReader` fall back to slow sequential reading.
+
 ### HDF5 file IO
 
 Lazily load HDF5 with a dict-like interface (contents are only loaded when accessed):

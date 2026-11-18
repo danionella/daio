@@ -335,6 +335,42 @@ class VideoReader(_TagReader):
         ''' Presentation times of all frames (in seconds). '''
         return self.frame_pts * float(self.stream.time_base)
 
+    def frame_index(self, time, rounding='round'):
+        ''' Frame index at a time (in seconds, on the clock of frame_times; a number or an array of times). E.g. the
+        frame shown with an audio sample: reader.frame_index(audio.sample_time(i)).
+
+        Args:
+            time (float or array): time(s) in seconds
+            rounding: 'round' (default): the frame with the nearest time (-1 or nframes for times more than half a
+                frame interval before the first or after the last frame). 'floor': the frame shown at that time, i.e.
+                the last frame at or before it (-1 for times before the first frame; the last frame for times after
+                it). 'ceil': the first frame at or after that time (nframes for times after the last frame). None: a
+                fractional index, interpolated between frame times (extrapolated beyond the first and last frame).
+        Returns:
+            int or array of int (float for rounding=None)
+        '''
+        times = self.frame_times
+        t = np.asarray(time, dtype=np.float64)
+        floor = np.searchsorted(times, t + _TIME_TOLERANCE, side='right') - 1
+        if rounding == 'floor':
+            index = floor
+        elif rounding == 'ceil':
+            index = np.searchsorted(times, t - _TIME_TOLERANCE, side='left')
+        elif rounding == 'round':
+            lo, hi = np.clip(floor, 0, len(times) - 1), np.clip(floor + 1, 0, len(times) - 1)
+            index = np.where(np.abs(t - times[hi]) <= np.abs(t - times[lo]), hi, lo)
+            if len(times) > 1: # (outside the frames by more than half a frame interval: no nearest frame)
+                index = np.where(t < times[0] - (times[1] - times[0]) / 2 - _TIME_TOLERANCE, -1, index)
+                index = np.where(t >= times[-1] + (times[-1] - times[-2]) / 2 - _TIME_TOLERANCE, len(times), index)
+        elif rounding is None:
+            if len(times) < 2:
+                return _scalar_or_array(np.zeros_like(t) if len(times) else np.full_like(t, np.nan))
+            k = np.clip(floor, 0, len(times) - 2)
+            index = k + (t - times[k]) / (times[k + 1] - times[k])
+        else:
+            raise ValueError(f"rounding must be 'floor', 'ceil', 'round' or None, not {rounding!r}")
+        return _scalar_or_array(index)
+
     def read(self):
         ''' Read the next frame in the specified format. '''
         frame_obj = next(self.framegenerator)
@@ -695,6 +731,7 @@ class AudioReader(_TagReader):
         self._nsamples = None
         self._cursor = None  # (sample position, frame generator, pending (position, samples)) after the last read
         self._checked = False  # whether the time stamps were checked for gaps (before the first random access)
+        self._table = None  # (first sample, time, samples) of each decoded frame, for streams with gaps (see _frame_table)
         self._calibrate()
 
     def _open(self):
@@ -942,10 +979,88 @@ class AudioReader(_TagReader):
         return None
 
     def read_time(self, start_time, stop_time):
-        ''' Read the samples from start_time to stop_time (in seconds, on the same clock as VideoReader.frame_times).
-        Sample i is taken to be at start_time + i / sample_rate, which holds for audio without gaps. '''
-        to_sample = lambda t: round((t - self.start_time) * self.sample_rate)
-        return self.read(max(to_sample(start_time), 0), max(to_sample(stop_time), 0))
+        ''' Read the samples from start_time to stop_time, in seconds on the same clock as VideoReader.frame_times:
+        samples sample_index(start_time) to sample_index(stop_time) (exclusive), each rounded to the nearest sample.
+        Consecutive time windows (e.g. of consecutive video frames) thus split the audio without gaps or overlaps. '''
+        return self.read(self.sample_index(start_time), self.sample_index(stop_time))
+
+    def sample_time(self, index):
+        ''' Presentation time (in seconds, on the same clock as VideoReader.frame_times) of a sample index (an integer
+        or an array of integers, from 0 to nsamples; nsamples gives the time just after the last sample). Without gaps
+        in the time stamps, sample i is at start_time + i / sample_rate. For streams with gaps or overlaps, times come
+        from the time stamp of the decoded frame that contains the sample (the stream is decoded once to find them). '''
+        i = np.asarray(index)
+        if i.dtype.kind not in 'iu':
+            raise TypeError(f'sample indices must be integers, not {i.dtype}')
+        if np.any((i < 0) | (i > self.nsamples)):
+            raise IndexError(f'sample indices must be from 0 to {self.nsamples}')
+        if self._check_time_stamps():
+            t = self._start_time + i / self.sample_rate
+        else:
+            starts, times, _ = self._frame_table()
+            k = np.clip(np.searchsorted(starts, i, side='right') - 1, 0, None)
+            t = times[k] + (i - starts[k]) / self.sample_rate
+        return _scalar_or_array(t)
+
+    def sample_index(self, time, rounding='round'):
+        ''' Sample index at a time (in seconds, on the same clock as VideoReader.frame_times; a number or an array of
+        times). The inverse of sample_time: sample_index(sample_time(i)) == i (except where time stamps overlap).
+
+        Args:
+            time (float or array): time(s) in seconds
+            rounding: 'round' (default): the sample with the nearest time. 'floor': the last sample at or before
+                that time (the sample playing at that time). 'ceil': the first sample at or after that time. Integer
+                results are clipped to 0 ... nsamples, and times in a gap of the time stamps give the first sample
+                after the gap. None: a fractional index (not clipped; extrapolated before the first and after the last
+                sample).
+        Returns:
+            int or array of int (float for rounding=None)
+        '''
+        if rounding not in ('ceil', 'floor', 'round', None):
+            raise ValueError(f"rounding must be 'ceil', 'floor', 'round' or None, not {rounding!r}")
+        t = np.asarray(time, dtype=np.float64)
+        rate = self.sample_rate
+        if self._check_time_stamps():
+            index = (t - self._start_time) * rate
+        else:
+            starts, times, sizes = self._frame_table()
+            k = np.clip(np.searchsorted(np.maximum.accumulate(times), t + _TIME_TOLERANCE, side='right') - 1, 0, None)
+            lo = np.where(k == 0, -np.inf, 0) # (in a gap: the end of the frame before it, i.e. the next sample)
+            hi = np.where(k == len(starts) - 1, np.inf, sizes[k])
+            index = starts[k] + np.clip((t - times[k]) * rate, lo, hi)
+        if rounding is None:
+            return _scalar_or_array(index)
+        tolerance = _TIME_TOLERANCE * rate
+        if rounding == 'ceil':
+            index = np.ceil(index - tolerance)
+        elif rounding == 'floor':
+            index = np.floor(index + tolerance)
+        else:
+            index = np.floor(index + 0.5)
+        return _scalar_or_array(np.clip(index, 0, self.nsamples).astype(np.int64))
+
+    def _frame_table(self):
+        ''' First sample (counted), presentation time and number of samples of each decoded frame (decodes the stream
+        once). Frames without a time stamp follow the previous frame; a shortened first frame (e.g. encoder priming)
+        starts at start_time. '''
+        if self._table is None:
+            starts, times, sizes = [], [], []
+            pos, next_time = 0, self._start_time
+            tb, rate = float(self.stream.time_base), self.sample_rate
+            self._rewind()
+            for frame in self.container.decode(self.stream):
+                t = next_time if frame.pts is None else frame.pts * tb
+                if not starts and abs(t - self._start_time) * rate < (self._frame_size or frame.samples):
+                    t = self._start_time # (time stamp of the first frame before shortening)
+                starts.append(pos); times.append(t); sizes.append(frame.samples)
+                pos += frame.samples
+                next_time = t + frame.samples / rate
+            self._rewind()
+            self._cursor = None
+            self._nsamples = pos
+            self._table = (np.array(starts, dtype=np.int64), np.array(times, dtype=np.float64),
+                           np.array(sizes, dtype=np.int64))
+        return self._table
 
     def __getitem__(self, index):
         if isinstance(index, (int, np.integer)):
@@ -977,6 +1092,15 @@ class AudioReader(_TagReader):
     def __exit__(self, exc_type, exc_value, traceback):
         self.close()
         return False
+
+
+_TIME_TOLERANCE = 1e-9 # seconds: times that differ by less (e.g. float rounding) are taken to be equal
+
+
+def _scalar_or_array(values):
+    ''' A Python scalar for 0-d results (int or float), else the array. '''
+    values = np.asarray(values)
+    return values.item() if values.ndim == 0 else values
 
 
 def _fixed_frame_size(codec_context):

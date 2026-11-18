@@ -474,6 +474,64 @@ def test_audio_reader_checks_mp4_index_without_decoding(tmp_path):
                     assert audio._nsamples is None, codec # (not decoded: the whole stream would have been counted)
             assert any('overlaps in the time stamps' in str(w.message) for w in caught) == (gap is not None), codec
 
+def test_audio_video_time_mapping(tmp_path):
+    """ Audio samples and video frames map to each other through time (seconds on the same clock), for scalars and
+    arrays, with selectable rounding; also for audio with a gap in the time stamps. """
+    import pytest
+    rate, fps = 48000, 25
+    video = tmp_path / 'av.mp4'
+    with VideoWriter(video, fps=fps, frame_shape=(64, 96), audio_rate=rate, audio_channels=1) as writer:
+        writer.write_audio(_sine(rate, 3, channels=1))
+        writer.write_frames(_ramp_frames(3 * fps))
+    with VideoReader(video) as reader, AudioReader(video) as audio:
+        n, times = audio.nsamples, reader.frame_times
+        # samples <-> times
+        i = np.arange(0, n + 1, 7)
+        assert isinstance(audio.sample_time(5), float) and isinstance(audio.sample_index(0.5), int)
+        assert audio.sample_index(audio.sample_time(1000) + 0.6 / rate) == 1001 # (nearest sample by default)
+        assert np.allclose(audio.sample_time(i), audio.start_time + i / rate)
+        assert np.array_equal(audio.sample_index(audio.sample_time(i)), i)
+        t = audio.sample_time(1000) + 0.3 / rate # between samples 1000 and 1001
+        assert [audio.sample_index(t, r) for r in ['floor', 'ceil', 'round']] == [1000, 1001, 1000]
+        assert np.isclose(audio.sample_index(t, rounding=None), 1000.3)
+        assert audio.sample_index(-10.0) == 0 and audio.sample_index(1e6) == n # (clipped)
+        with pytest.raises(IndexError):
+            audio.sample_time(n + 1)
+        # frames <-> times
+        k = np.arange(len(times))
+        for rounding in ['floor', 'ceil', 'round']:
+            assert np.array_equal(reader.frame_index(times, rounding), k), rounding
+        mid = (times[:-1] + times[1:]) / 2
+        assert np.array_equal(reader.frame_index(mid - 1e-4), k[:-1]) and np.array_equal(reader.frame_index(mid + 1e-4), k[1:])
+        assert np.array_equal(reader.frame_index(mid, 'floor'), k[:-1])
+        assert np.array_equal(reader.frame_index(mid, 'ceil'), k[1:])
+        assert np.allclose(reader.frame_index(mid, rounding=None), k[:-1] + 0.5)
+        assert reader.frame_index(times[0] - 0.4 / fps) == 0 and reader.frame_index(times[0] - 0.6 / fps) == -1
+        assert reader.frame_index(times[-1] + 0.6 / fps) == len(times) == reader.frame_index(times[-1] + 1, 'ceil')
+        assert reader.frame_index(times[0] - 1, 'floor') == -1
+        assert isinstance(reader.frame_index(1.0), int)
+        # the samples read during frame k are exactly those whose time falls within frame k
+        frame_of_sample = reader.frame_index(audio.sample_time(np.arange(n)), 'floor')
+        bounds = audio.sample_index(np.append(times, times[-1] + 1 / fps), 'ceil')
+        for j in range(len(times)):
+            assert np.all(frame_of_sample[bounds[j]:bounds[j + 1]] == j), j
+            assert audio.read_time(times[j], times[j] + 1 / fps).shape[1] == bounds[j + 1] - bounds[j] == rate // fps
+    # audio with a gap in the time stamps: times jump across the gap
+    gapped = tmp_path / 'gap.mkv'
+    frame_size = _write_audio(gapped, 'flac', _sine(rate, 2, channels=1), rate, gap=(10, 12000))
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore')
+        with AudioReader(gapped) as audio:
+            first_after = 10 * frame_size
+            step = audio.sample_time(first_after) - audio.sample_time(first_after - 1)
+            assert abs(step * rate - 12001) < rate * 1e-3 # (mkv time stamps: 1 ms)
+            assert audio.sample_index(audio.sample_time(first_after) - 0.1) == first_after # time in the gap
+            i = np.arange(0, audio.nsamples, 13)
+            assert np.array_equal(audio.sample_index(audio.sample_time(i)), i)
+            edges = audio.start_time + np.arange(0, 2.5, 0.04)
+            assert np.array_equal(np.concatenate([audio.read_time(a, b) for a, b in zip(edges[:-1], edges[1:])], axis=1),
+                                  audio.read())
+
 def test_reader_stream_selection(tmp_path):
     """ VideoReader and AudioReader read a selected stream: by stream index, or by handler_name. """
     import pytest

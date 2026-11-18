@@ -62,6 +62,19 @@ reader.read_tag('handler_name', stream=0)  # a stream's tag (stream index or han
 ```
 Which tags a file keeps depends on the container: mp4 keeps custom container tags only if written with `movflags=use_metadata_tags`, mkv stores tag names in upper case (`read_tag` ignores case), and avi drops custom tags.
 
+Files with several video streams: pick one with `VideoReader(path, stream=...)`, by stream index (as in `list_tags()`) or by its `handler_name` tag. By default, the first video stream is read.
+
+Read audio (from any file FFmpeg can open, e.g. mp4/m4a, mkv, wav, flac, mp3):
+```python
+from daio.video import AudioReader
+with AudioReader('/path/to/video.mp4') as audio:  # first audio stream; or stream=index / handler_name
+    audio.sample_rate, audio.channels, audio.nsamples
+    everything = audio.read()  # float32 array, shape (channels, samples), scaled to [-1, 1]
+    snippet = audio[48000:96000]  # by sample index: same samples as reading sequentially
+    during_frame_7 = audio.read_time(reader.frame_times[7], reader.frame_times[8])  # same clock as VideoReader
+```
+Sample `i` is the i-th decoded sample. Random access is bit-exact for uncompressed and lossless audio (wav, flac), mp3, and aac written by `VideoWriter`. Some lossy decoders synthesize noise, so samples read after a jump can differ from a sequential read: opus by about 1e-4, and aac with perceptual noise substitution (the default of FFmpeg's aac encoder) as much as the noise-like parts of the signal (encode with `-aac_pns 0` to avoid this). Before the first random access, `AudioReader` checks that the time stamps have no gaps or overlaps (instantly for aac in mp4; other files are decoded once, at about 1000x real time). Files with gaps (e.g. dropped audio) or overlaps, and flac or vorbis in ogg files, are read by counting samples instead, with a warning.
+
 Note on precision: video encoding is lossy by default (`crf=23`). Grayscale frames are stored in the luma channel of `yuv420p` video, which uses the limited range 16-235, so even lossless settings (`crf=0`) can change gray values by ±1. If you need exact values, store the data in HDF5 instead, or encode RGB frames losslessly with e.g. `VideoWriter(path, codec='libx264rgb', pix_fmt='rgb24', crf=0)`.
 
 You can also use with statements to handle file closure:

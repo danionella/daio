@@ -5,7 +5,7 @@ import warnings
 
 import av
 import numpy as np
-from daio.video import VideoReader, VideoWriter
+from daio.video import VideoReader, VideoWriter, AudioReader
 from daio.h5 import lazyh5, save_to_h5, load_from_h5
 
 def test_trivial():
@@ -343,6 +343,166 @@ def test_video_tags(tmp_path):
             with pytest.raises(KeyError):
                 reader.read_tag('title', stream='no such stream')
             reader.close()
+
+def _sine(rate, seconds, channels=2):
+    t = np.arange(int(rate * seconds)) / rate
+    return np.stack([0.3 * np.sin(2 * np.pi * (300 + 200 * c) * t) for c in range(channels)]).astype(np.float32)
+
+def _write_audio(filename, codec, signal, rate, frame_size=1024, gap=None, container_format=None, extra_streams=()):
+    """ Write audio with PyAV (optionally with a gap in the time stamps: (frame number, samples)). Frames have the
+    encoder's frame size, if it has one. Returns the frame size. """
+    from fractions import Fraction
+    layout = 'mono' if signal.shape[0] == 1 else 'stereo'
+    with av.open(str(filename), 'w', format=container_format) as container:
+        stream = container.add_stream(codec, rate=rate, layout=layout)
+        stream.codec_context.open()
+        frame_size = stream.codec_context.frame_size or frame_size
+        fmt = stream.codec_context.format
+        for k in range(0, signal.shape[1], frame_size):
+            chunk = signal[:, k:k + frame_size]
+            if fmt.name.startswith(('s16', 's32')):
+                bits = 16 if fmt.name.startswith('s16') else 32
+                chunk = np.round(chunk * (2 ** (bits - 1) - 1)).astype(np.int16 if bits == 16 else np.int32)
+            if not fmt.is_planar:
+                chunk = chunk.T.reshape(1, -1)
+            frame = av.AudioFrame.from_ndarray(np.ascontiguousarray(chunk), format=fmt.name, layout=layout)
+            frame.sample_rate, frame.time_base = rate, Fraction(1, rate)
+            frame.pts = k + (gap[1] if gap and k // frame_size >= gap[0] else 0)
+            for packet in stream.encode(frame):
+                container.mux(packet)
+        for packet in stream.encode():
+            container.mux(packet)
+    return frame_size
+
+def _decode_audio(filename, stream=None):
+    """ Reference: all samples of a plain sequential PyAV decode, float32 (channels, samples). """
+    from daio.video import _audio_frame_to_float
+    with av.open(str(filename)) as container:
+        s = container.streams.audio[0] if stream is None else container.streams[stream]
+        return np.concatenate([_audio_frame_to_float(f) for f in container.decode(s)], axis=1)
+
+def test_audio_reader(tmp_path):
+    """ Random access returns the same samples as a sequential decode (bit-exact for lossless and uncompressed audio;
+    aac decoders synthesize noise, so samples after a seek differ by tiny amounts). """
+    import io
+    rate = 48000
+    signal = _sine(rate, 3)
+    files = {'pcm.wav': ('pcm_s16le', 0), 'lossless.flac': ('flac', 0), 'lossless_in.mkv': ('flac', 0), 'lossy.mp3': ('libmp3lame', 0)}
+    for name, (codec, tolerance) in files.items():
+        _write_audio(tmp_path / name, codec, signal, rate)
+    video = tmp_path / 'with_video.mp4' # aac written by VideoWriter, together with video
+    with VideoWriter(video, fps=25, frame_shape=(64, 96), audio_rate=rate, audio_channels=2) as writer:
+        writer.write_audio(signal)
+        writer.write_frames(_ramp_frames(75))
+    files['with_video.mp4'] = ('aac', 0) # (VideoWriter disables aac noise substitution)
+    for name, (codec, tolerance) in files.items():
+        reference = _decode_audio(tmp_path / name)
+        for source in [tmp_path / name, io.BytesIO((tmp_path / name).read_bytes())]:
+            with warnings.catch_warnings():
+                warnings.simplefilter('error') # no warnings for regular files
+                with AudioReader(source) as audio:
+                    assert audio.sample_rate == rate and audio.channels == 2 and audio.seekable, name
+                    assert audio.nsamples == len(audio) == reference.shape[1], name
+                    assert np.array_equal(audio.read(), reference), name
+                    rng = np.random.default_rng(0)
+                    for start in list(rng.integers(0, reference.shape[1] - 5000, 15)) + [0, reference.shape[1] - 100]:
+                        start = int(start)
+                        snippet = audio[start:start + 5000]
+                        expected = reference[:, start:start + 5000]
+                        assert snippet.shape == expected.shape and snippet.dtype == np.float32, (name, start)
+                        assert np.abs(snippet - expected).max() <= tolerance, (name, start)
+                    chunks = np.concatenate([audio.read(i, i + 4800) for i in range(0, audio.nsamples, 4800)], axis=1)
+                    assert np.array_equal(chunks, reference), name # sequential reading in chunks
+                    assert np.allclose(audio[-1], reference[:, -1], atol=tolerance)
+                    assert np.allclose(audio[100:50000:7], reference[:, 100:50000:7], atol=tolerance)
+    # audio during a video frame (same clock as VideoReader.frame_times)
+    with VideoReader(video) as reader, AudioReader(video) as audio:
+        t = reader.frame_times
+        assert audio.read_time(t[10], t[11]).shape == (2, rate // 25)
+
+def test_audio_reader_gap_in_time_stamps(tmp_path):
+    """ Sample i is the i-th decoded sample, also if the time stamps have a gap (e.g. dropped audio) or overlap, or are
+    unreliable after seeking (flac in ogg): random access then counts decoded samples (with a warning), instead of
+    trusting the time stamps. """
+    rate = 48000
+    signal = _sine(rate, 2, channels=1)
+    cases = [ # name, codec, gap (frame number, samples), expected warning
+        ('gap.mp4', 'flac', (10, 12000), 'overlaps in the time stamps'),
+        ('gap.mkv', 'flac', (10, 12000), 'overlaps in the time stamps'),
+        ('overlap.mp4', 'flac', (10, -3000), 'overlaps in the time stamps'),
+        ('overlap.mkv', 'flac', (10, -3000), 'overlaps in the time stamps'),
+        ('gap_before_last_frame.mp4', 'libmp3lame', (96000 // 1152, 5000), 'overlaps in the time stamps'),
+        ('gap_after_first_frame.mkv', 'flac', (1, 4800), 'gap or overlap after the first frame'),
+        ('flac.ogg', 'flac', None, 'unreliable after seeking'),
+        ('no_gap.mkv', 'flac', None, None)]
+    for name, codec, gap, warning in cases:
+        filename = tmp_path / name
+        frame_size = _write_audio(filename, codec, signal, rate, gap=gap)
+        reference = _decode_audio(filename)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter('always')
+            with AudioReader(filename) as audio:
+                assert audio.nsamples == len(audio) == reference.shape[1], name # no samples lost or added
+                assert codec != 'flac' or audio.nsamples == signal.shape[1], name # (mp3 can keep encoder padding)
+                for start in [100, 10 * frame_size - 300, 10 * frame_size + 5000, 70000, 20000, audio.nsamples - 3000]:
+                    assert np.array_equal(audio[start:start + 3000], reference[:, start:start + 3000]), (name, start)
+                assert np.array_equal(audio[-1], reference[:, -1]), name
+                chunks = [audio.read(i, i + 4000) for i in range(0, audio.nsamples, 4000)]
+                assert np.array_equal(np.concatenate(chunks, axis=1), reference), name
+                assert np.array_equal(audio.read(), reference), name
+                assert audio.seekable == (warning is None), name
+        messages = [str(w.message) for w in caught]
+        assert (any(warning in m for m in messages) if warning else not messages), (name, messages)
+
+def test_reader_stream_selection(tmp_path):
+    """ VideoReader and AudioReader read a selected stream: by stream index, or by handler_name. """
+    import pytest
+    from fractions import Fraction
+    filename = tmp_path / 'streams.mkv'
+    rate = 16000
+    signals = [_sine(rate, 1, channels=1), 0.5 * _sine(rate, 1, channels=1)[:, ::-1].copy()]
+    with av.open(str(filename), 'w') as container:
+        video_streams = []
+        for k, name in enumerate(['camA', 'camB']):
+            vs = container.add_stream('libx264', rate=25, options={'g': '10'})
+            vs.width, vs.height, vs.pix_fmt = 96, 64, 'yuv420p'
+            vs.metadata['handler_name'] = name
+            video_streams.append(vs)
+        audio_streams = []
+        for name in ['micA', 'micB']:
+            aus = container.add_stream('flac', rate=rate, layout='mono')
+            aus.metadata['handler_name'] = name
+            audio_streams.append(aus)
+        for i in range(25):
+            for k, vs in enumerate(video_streams):
+                frame = av.VideoFrame.from_ndarray(np.full((64, 96), 40 + 120 * k, np.uint8), format='gray')
+                frame.pts = i
+                for packet in vs.encode(frame):
+                    container.mux(packet)
+        for k, aus in enumerate(audio_streams):
+            for j in range(0, rate, 1024):
+                frame = av.AudioFrame.from_ndarray(np.ascontiguousarray((signals[k][:, j:j + 1024] * 32767).astype(np.int16)), format='s16', layout='mono')
+                frame.sample_rate, frame.time_base, frame.pts = rate, Fraction(1, rate), j
+                for packet in aus.encode(frame):
+                    container.mux(packet)
+        for s in video_streams + audio_streams:
+            for packet in s.encode():
+                container.mux(packet)
+    with av.open(str(filename)) as container:
+        index = {s.metadata.get('handler_name', s.metadata.get('HANDLER_NAME')): s.index for s in container.streams}
+    for selection, brightness in [(None, 40), (index['camB'], 160), ('camB', 160)]:
+        with VideoReader(filename, stream=selection) as reader:
+            assert abs(reader[5].mean() - brightness) < 3, selection
+    assert tuple(VideoReader.static_shape(filename, stream='camB')[1:]) == (64, 96)
+    for selection, k in [(None, 0), (index['micB'], 1), ('micB', 1)]:
+        with AudioReader(filename, stream=selection) as audio:
+            assert np.array_equal(audio.read(), _decode_audio(filename, stream=index[['micA', 'micB'][k]])), selection
+    with pytest.raises(ValueError): # not a video stream
+        VideoReader(filename, stream=index['micA'])
+    with pytest.raises(ValueError): # not an audio stream
+        AudioReader(filename, stream=index['camA'])
+    with pytest.raises(KeyError):
+        AudioReader(filename, stream='no such stream')
 
 def test_video_slicing_and_iteration(tmp_path):
     filename = tmp_path / 'slicing.mp4'

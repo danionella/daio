@@ -369,8 +369,8 @@ class VideoReader(_TagReader):
             time (float or array): time(s) in seconds
             rounding: 'round' (default): the frame with the nearest time (-1 or nframes for times more than half a
                 frame interval before the first or after the last frame). 'floor': the frame shown at that time, i.e.
-                the last frame at or before it (-1 for times before the first frame; the last frame for times after
-                it). 'ceil': the first frame at or after that time (nframes for times after the last frame). None: a
+                the last frame at or before it (never negative: 0 for times before the first frame; the last frame for
+                times after it). 'ceil': the first frame at or after that time (nframes for times after the last frame). None: a
                 fractional index, interpolated between frame times (extrapolated beyond the first and last frame).
         Returns:
             int or array of int (float for rounding=None)
@@ -381,7 +381,7 @@ class VideoReader(_TagReader):
         t = np.asarray(time, dtype=np.float64)
         floor = np.searchsorted(times, t + _TIME_TOLERANCE, side='right') - 1
         if rounding == 'floor':
-            index = floor
+            index = np.maximum(floor, 0) # (never negative: -1 would index the last frame)
         elif rounding == 'ceil':
             index = np.searchsorted(times, t - _TIME_TOLERANCE, side='left')
         elif rounding == 'round':

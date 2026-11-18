@@ -543,7 +543,8 @@ def test_audio_video_time_mapping(tmp_path):
         assert np.allclose(reader.frame_index(mid, rounding=None), k[:-1] + 0.5)
         assert reader.frame_index(times[0] - 0.4 / fps) == 0 and reader.frame_index(times[0] - 0.6 / fps) == -1
         assert reader.frame_index(times[-1] + 0.6 / fps) == len(times) == reader.frame_index(times[-1] + 1, 'ceil')
-        assert reader.frame_index(times[0] - 1, 'floor') == -1
+        assert reader.frame_index(times[0] - 1, 'floor') == 0 # (never negative)
+        assert np.all(reader.frame_index(times[0] - np.array([1e-3, 1, 1e6]), 'floor') == 0)
         assert isinstance(reader.frame_index(1.0), int)
         assert reader.frame_time(7) == times[7] and isinstance(reader.frame_time(7), float)
         assert np.array_equal(reader.frame_time([3, -1]), times[[3, -1]])

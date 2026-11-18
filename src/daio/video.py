@@ -1218,6 +1218,80 @@ class AudioReader(_TagReader):
         return False
 
 
+def list_streams(filename):
+    ''' List the streams of a file, from its header and index (no decoding; the file is opened once).
+
+    Args:
+        filename (str or file-like): path to the file
+
+    Returns:
+        list of dict, one per stream, with keys:
+            index (int): stream index (as accepted by stream= of VideoReader and AudioReader)
+            type (str): 'video', 'audio', 'subtitle', 'data', ...
+            name (str or None): the handler_name tag (as accepted by stream=)
+            codec (str): codec name
+            start_time, duration (float or None): in seconds, as stated by the file (None if it does not state them)
+            video: fps (float or None: nominal frame rate), width, height, frames (int or None)
+            audio: sample_rate, channels
+        frames is given only where the index of the file counts the frames exactly (mp4, also fragmented or cut off,
+        without edit lists that discard frames), else None (e.g. mkv, avi, whose headers count dropped frames). Exact
+        counts: VideoReader(path, stream=...).nframes, AudioReader(path, stream=...).nsamples (both decode a few
+        frames; durations stated by files can be off, e.g. for audio with gaps or encoder priming).
+
+    Example:
+        >>> for s in list_streams('/path/to/video.mp4'):
+        ...     print(s['index'], s['type'], s['name'], s['codec'], s['duration'])
+    '''
+    if hasattr(filename, 'seek'):
+        filename.seek(0)
+    with av.open(filename) as container:
+        file_size = getattr(container, 'size', None)
+        is_mp4 = container.format.name.startswith('mov')
+        streams = []
+        for stream in container.streams:
+            tb = stream.time_base
+            info = dict(index=stream.index, type=stream.type, name=_get_tag(stream.metadata, 'handler_name'),
+                        codec=stream.codec_context.name,
+                        start_time=None if stream.start_time is None or tb is None else float(stream.start_time * tb),
+                        duration=_stream_duration(stream))
+            if stream.type == 'video':
+                rate = stream.guessed_rate or stream.average_rate
+                frames = _exact_frame_count(stream, file_size) if is_mp4 else None
+                info.update(fps=float(rate) if rate else None, width=stream.codec_context.width,
+                            height=stream.codec_context.height, frames=frames)
+            elif stream.type == 'audio':
+                info.update(sample_rate=stream.codec_context.sample_rate,
+                            channels=stream.codec_context.layout.nb_channels)
+            streams.append(info)
+    return streams
+
+
+def _exact_frame_count(stream, file_size):
+    ''' Frame count of an mp4 video stream from its index, if exact without decoding (else None): one entry per frame
+    (the frame count in the header, or for fragmented mp4 all entries within the file), none of them discarded (e.g. by
+    an edit list), and the first entry a key frame. '''
+    entries = stream.index_entries
+    if not len(entries) or any(e.is_discard for e in entries) or not entries[0].is_keyframe:
+        return None
+    if stream.frames:
+        return stream.frames if len(entries) == stream.frames else None
+    if all(e.is_keyframe for e in entries): # (key frames only: not an index of all frames)
+        return None
+    return sum(1 for e in entries if not file_size or file_size <= 0 or e.pos + e.size <= file_size)
+
+
+def _stream_duration(stream):
+    ''' Duration of a stream in seconds, as stated by the file (stream header, or e.g. the DURATION tag of mkv). '''
+    if stream.duration and stream.time_base:
+        return float(stream.duration * stream.time_base)
+    tag = _get_tag(stream.metadata, 'DURATION') # (mkv, e.g. '00:01:02.345000000')
+    try:
+        h, m, sec = tag.split(':')
+        return int(h) * 3600 + int(m) * 60 + float(sec)
+    except (AttributeError, ValueError):
+        return None
+
+
 _TIME_TOLERANCE = 1e-9 # seconds: times that differ by less (e.g. float rounding) are taken to be equal
 
 

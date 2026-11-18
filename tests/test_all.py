@@ -578,6 +578,50 @@ def test_audio_video_time_mapping(tmp_path):
             assert np.array_equal(np.concatenate([audio.read_time(a, b) for a, b in zip(edges[:-1], edges[1:])], axis=1),
                                   audio.read())
 
+def test_list_streams(tmp_path):
+    """ list_streams describes each stream from the header and index; frame counts only where they are exact. """
+    import io
+    from daio.video import list_streams
+    rate = 48000
+    video = tmp_path / 'av.mp4'
+    with VideoWriter(video, fps=25, frame_shape=(64, 96), audio_rate=rate, audio_channels=2) as writer:
+        writer.write_audio(_sine(rate, 2))
+        writer.write_frames(_ramp_frames(50))
+    fragmented = tmp_path / 'frag.mp4'
+    with av.open(str(video)) as ic, av.open(str(fragmented), 'w', options={'movflags': 'frag_keyframe+empty_moov'}) as oc:
+        ost = oc.add_stream_from_template(ic.streams.video[0])
+        for packet in ic.demux(video=0):
+            if packet.dts is not None:
+                packet.stream = ost
+                oc.mux(packet)
+    for source in [video, io.BytesIO(video.read_bytes())]:
+        v, a = list_streams(source)
+        assert (v['index'], v['type'], v['codec'], v['fps'], v['width'], v['height']) == (0, 'video', 'h264', 25, 96, 64)
+        assert v['frames'] == 50 and abs(v['duration'] - 2) < 0.05 and v['start_time'] == 0
+        assert (a['index'], a['type'], a['codec'], a['sample_rate'], a['channels']) == (1, 'audio', 'aac', rate, 2)
+        assert 'frames' not in a and abs(a['duration'] - 2) < 0.05
+    assert [s['frames'] for s in list_streams(fragmented)] == [50] # (fragmented mp4: counted from the index)
+    # names as accepted by stream=, and no frame counts where the file does not count frames exactly (mkv)
+    mkv = tmp_path / 'named.mkv'
+    with av.open(str(mkv), 'w') as container:
+        for name in ['camA', 'camB']:
+            vs = container.add_stream('libx264', rate=25)
+            vs.width, vs.height, vs.pix_fmt = 96, 64, 'yuv420p'
+            vs.metadata['handler_name'] = name
+        for i in range(10):
+            for vs in container.streams.video:
+                frame = av.VideoFrame.from_ndarray(np.full((64, 96), 100, np.uint8), format='gray')
+                frame.pts = i
+                for packet in vs.encode(frame.reformat(format='yuv420p')):
+                    container.mux(packet)
+        for vs in container.streams.video:
+            for packet in vs.encode():
+                container.mux(packet)
+    listed = list_streams(mkv)
+    assert [(s['index'], s['name'], s['frames']) for s in listed] == [(0, 'camA', None), (1, 'camB', None)]
+    with VideoReader(mkv, stream=listed[1]['name']) as reader:
+        assert reader.nframes == 10
+
 def test_reader_stream_selection(tmp_path):
     """ VideoReader and AudioReader read a selected stream: by stream index, or by handler_name. """
     import pytest

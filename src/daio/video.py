@@ -126,19 +126,32 @@ class VideoReader:
         return ts.astype(np.int64), kf.astype(bool), discard.astype(bool), pos.astype(np.int64), bool(n)
 
     def _index_tail_matches(self, ts, kf, pos):
-        ''' Check an index without frame count: decoding from its last key frame to the end of the file must yield
-        exactly its last frames (by file position), and nothing after them. '''
+        ''' Check an index without frame count: the packets from its last key frame to the end of the file must be
+        exactly its last entries (by file position, in order), followed by nothing but damaged packets (cut-off
+        recordings). Only packets are read, no frames decoded; stops at the first mismatch. '''
         k = int(np.flatnonzero(kf)[-1])
-        decoded = []
+        index_of = {int(p): i for i, p in enumerate(pos)}
+        expected = None # index entry of the next packet
         try:
             self.container.seek(int(ts[k]), backward=True, stream=self.stream)
-            for frame in self._decode():
-                decoded.append(None if frame.opaque is None else frame.opaque[0])
+            for packet in self.container.demux(self.stream):
+                if packet.size == 0 or packet.is_discard:
+                    continue
+                if expected is None: # first packet after the seek: must be in the index, at or before entry k
+                    expected = index_of.get(packet.pos)
+                    if expected is None or expected > k:
+                        return False
+                if expected < len(pos):
+                    if packet.pos != pos[expected]:
+                        return False
+                    expected += 1
+                elif not packet.is_corrupt: # more packets than the index lists
+                    return False
         except av.FFmpegError:
             return False
         finally:
             self.rewind()
-        return len(pos) - k <= len(decoded) <= len(pos) and decoded == list(pos[len(pos) - len(decoded):])
+        return expected == len(pos)
 
     def _auto_index(self):
         ''' Choose the cheapest reliable way to map frame indices to time stamps (see class docstring). '''

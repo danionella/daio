@@ -62,7 +62,7 @@ reader.read_tag('handler_name', stream=0)  # a stream's tag (stream index or han
 ```
 Which tags a file keeps depends on the container: mp4 keeps custom container tags only if written with `movflags=use_metadata_tags`, mkv stores tag names in upper case (`read_tag` ignores case), and avi drops custom tags.
 
-Files with several video streams: pick one with `VideoReader(path, stream=...)`, by stream index (as in `list_tags()`) or by its `handler_name` tag. By default, the first video stream is read.
+Files with several video streams: pick one with `VideoReader(path, stream=...)`, by stream index (as in `list_tags()`) or by its `handler_name` tag. By default, the first video stream is read. `list_streams(path)` lists the streams of a file (index, type, name, codec, frame rate or sample rate, start time, duration; frame counts where the file states them exactly), reading only its header and index.
 
 Note on precision: video encoding is lossy by default (`crf=23`). Grayscale frames are stored in the luma channel of `yuv420p` video, which uses the limited range 16-235, so even lossless settings (`crf=0`) can change gray values by ±1. If you need exact values, store the data in HDF5 instead, or encode RGB frames losslessly with e.g. `VideoWriter(path, codec='libx264rgb', pix_fmt='rgb24', crf=0)`.
 

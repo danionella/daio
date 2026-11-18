@@ -348,12 +348,13 @@ def _sine(rate, seconds, channels=2):
     t = np.arange(int(rate * seconds)) / rate
     return np.stack([0.3 * np.sin(2 * np.pi * (300 + 200 * c) * t) for c in range(channels)]).astype(np.float32)
 
-def _write_audio(filename, codec, signal, rate, frame_size=1024, gap=None, container_format=None, extra_streams=()):
+def _write_audio(filename, codec, signal, rate, frame_size=1024, gap=None, container_format=None, extra_streams=(),
+                 container_options=None):
     """ Write audio with PyAV (optionally with a gap in the time stamps: (frame number, samples)). Frames have the
     encoder's frame size, if it has one. Returns the frame size. """
     from fractions import Fraction
     layout = 'mono' if signal.shape[0] == 1 else 'stereo'
-    with av.open(str(filename), 'w', format=container_format) as container:
+    with av.open(str(filename), 'w', format=container_format, options=container_options or {}) as container:
         stream = container.add_stream(codec, rate=rate, layout=layout)
         stream.codec_context.open()
         frame_size = stream.codec_context.frame_size or frame_size
@@ -458,21 +459,42 @@ def test_audio_reader_gap_in_time_stamps(tmp_path):
         messages = [str(w.message) for w in caught]
         assert (any(warning in m for m in messages) if warning else not messages), (name, messages)
 
-def test_audio_reader_checks_mp4_index_without_decoding(tmp_path):
-    """ In mp4, codecs with a guaranteed frame size (aac, alac, flac with a fixed block size) are checked for gaps using
-    the sample table only, without decoding the file; gaps are found there too. """
+def test_audio_reader_checks_time_stamps_without_decoding(tmp_path):
+    """ Codecs with a guaranteed frame size (aac, mp3, alac, flac with a fixed block size) are checked for gaps without
+    decoding: using the sample table of mp4, else the packet time stamps (fragmented mp4, mkv); gaps are found there
+    too. Cut-off recordings are read up to the damaged end. """
     rate = 48000
     signal = _sine(rate, 2, channels=1)
-    for codec in ['aac', 'alac', 'flac']:
+    fragmented = {'movflags': 'frag_keyframe+empty_moov'}
+    cases = [(codec, ext, options) for codec in ['aac', 'alac', 'flac', 'libmp3lame']
+             for ext, options in [('mp4', None), ('frag.mp4', fragmented), ('mkv', None)]
+             if not (codec == 'alac' and ext == 'mkv')]
+    for codec, ext, options in cases:
         for gap in [None, (10, 3000)]:
-            filename = tmp_path / f'{codec}_{gap is not None}.mp4'
-            _write_audio(filename, codec, signal, rate, gap=gap)
+            filename = tmp_path / f'{codec}_{gap is not None}.{ext}'
+            _write_audio(filename, codec, signal, rate, gap=gap, container_options=options)
             with warnings.catch_warnings(record=True) as caught:
                 warnings.simplefilter('always')
                 with AudioReader(filename) as audio:
-                    assert audio._check_time_stamps() == (gap is None), codec
-                    assert audio._nsamples is None, codec # (not decoded: the whole stream would have been counted)
-            assert any('overlaps in the time stamps' in str(w.message) for w in caught) == (gap is not None), codec
+                    assert audio._check_time_stamps() == (gap is None), (codec, ext)
+                    assert audio._nsamples is None, (codec, ext) # (not decoded: the whole stream would have been counted)
+            assert any('overlaps in the time stamps' in str(w.message) for w in caught) == (gap is not None), (codec, ext)
+        # a cut-off recording: read up to the damaged end, with a warning
+        cut = tmp_path / f'{codec}_cut.{ext}'
+        data = (tmp_path / f'{codec}_False.{ext}').read_bytes()
+        cut.write_bytes(data[:len(data) * 7 // 10])
+        if ext == 'mp4':
+            continue # (an mp4 cut off before its index at the end cannot be opened)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter('always')
+            with AudioReader(cut) as audio:
+                everything = audio.read()
+                assert audio.nsamples == everything.shape[1] > 0, (codec, ext)
+                end = audio.nsamples
+                atol = 2e-3 if codec == 'aac' else 0 # (aac noise substitution: see test_audio_reader)
+                assert np.allclose(audio[end - 5000:end], everything[:, end - 5000:], rtol=0, atol=atol), (codec, ext)
+                assert np.allclose(audio[1000:2000], everything[:, 1000:2000], rtol=0, atol=atol), (codec, ext)
+                assert audio.seekable, (codec, ext)
 
 def test_audio_video_time_mapping(tmp_path):
     """ Audio samples and video frames map to each other through time (seconds on the same clock), for scalars and

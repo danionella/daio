@@ -720,8 +720,8 @@ class AudioReader(_TagReader):
     Samples are returned as float32 arrays of shape (channels, samples), scaled to [-1, 1]. Sample index i is the i-th
     sample of a sequential decode from the start of the stream (no samples skipped or added), and `reader[a:b]`
     returns the same samples as reading sequentially. Fast random access uses the time stamps of the file; before the
-    first random access, they are checked for gaps and overlaps (using the container index if complete, else by
-    decoding the stream once). Files with gaps, overlaps or unusable time stamps (also flac and vorbis in ogg files,
+    first random access, they are checked for gaps and overlaps (for codecs with a fixed frame size: using the container
+    index if complete, else the packet time stamps; else by decoding the stream once). Files with gaps, overlaps or unusable time stamps (also flac and vorbis in ogg files,
     whose time stamps are unreliable after seeking) are read by counting decoded samples instead, with a warning:
     still correct, but jumping backwards decodes from the start of the file.
 
@@ -773,10 +773,31 @@ class AudioReader(_TagReader):
     def _rewind(self):
         self._open() # (seeking to 0 can skip the first frame, e.g. opus in mkv)
 
+    def _decode(self):
+        ''' Decode from the current position. Undecodable damaged packets (e.g. the last one of a cut-off recording)
+        are skipped, with a warning, in every way of reading (so that sample counts agree). '''
+        for packet in self.container.demux(self.stream):
+            try:
+                frames = packet.decode()
+            except av.InvalidDataError:
+                if not packet.is_corrupt:
+                    raise
+                if not getattr(self, '_warned_damaged', False):
+                    self._warned_damaged = True
+                    warnings.warn(f'{self._name}: undecodable damaged audio packet skipped (e.g. a cut-off recording)',
+                                  stacklevel=3)
+                continue
+            for frame in frames:
+                yield frame
+
+    @property
+    def _name(self):
+        return self.filename if isinstance(self.filename, (str, os.PathLike)) else 'file-like object'
+
     def _frames(self, from_start=False):
         ''' Decode from the current position: yields (sample position from the time stamp, or None; samples). When
         decoding from the start, the first frame is at position 0 (its time stamp can precede a shortened first frame). '''
-        for frame in self.container.decode(self.stream):
+        for frame in self._decode():
             if from_start:
                 pos, from_start = 0, False
             else:
@@ -791,13 +812,23 @@ class AudioReader(_TagReader):
         ref_pos, size, ref_raw = self._grid
         return ref_pos + round((raw - ref_raw) / size) * size
 
+    def _on_time(self, pts, counted):
+        ''' Whether a frame with this time stamp starts after exactly `counted` samples (for coarse time stamps: within
+        their rounding, so that also gaps smaller than half a frame are found). '''
+        if self._pos(pts) != counted:
+            return False
+        if self._grid is None:
+            return True
+        ref_pos, _, ref_raw = self._grid
+        return abs(pts * self._ticks - (ref_raw + counted - ref_pos)) <= 1.5 * self._ticks
+
     def _calibrate(self, n_frames=8):
         ''' Align time stamp positions with sample counts of a sequential decode: the first frame can be shortened
         (e.g. encoder priming, opus pre-skip) without its time stamp being adjusted. Frames after the first one must be
         contiguous. Time stamps coarser than one sample (e.g. 1 ms in mkv) are snapped to the grid of frame starts,
         which needs a constant frame size. '''
         self._rewind()
-        frames = [(frame.pts, frame.samples) for _, frame in zip(range(n_frames), self.container.decode(self.stream))]
+        frames = [(frame.pts, frame.samples) for _, frame in zip(range(n_frames), self._decode())]
         self._rewind()
         if not frames:
             self._nsamples = 0
@@ -822,18 +853,19 @@ class AudioReader(_TagReader):
                 starts.append(frames[0][0] * tb)
             lo, hi = max(starts) - tb / 2, min(starts) + tb / 2 # (time stamps are rounded to the nearest tick)
             self._start_time = (lo + hi) / 2 if lo <= hi else float(np.mean(starts))
-        if any(self._pos(frames[i][0]) != counted[i] for i in range(ref, len(frames))):
+        if any(not self._on_time(frames[i][0], counted[i]) for i in range(ref, len(frames))):
             return self._set_unseekable('irregular time stamps')
         if abs(self._pos(frames[0][0])) >= frames[ref][1]: # more than a shortened first frame
             return self._set_unseekable('gap or overlap after the first frame')
 
     def _check_time_stamps(self):
         ''' Check (once, before the first random access) that the time stamps have no gaps or overlaps, so that
-        positions from time stamps equal sample counts. If the codec guarantees a fixed frame size (e.g. aac, alac,
-        flac with a fixed block size) and the container index is complete (e.g. mp4), the index is checked: every frame
-        but the last must last exactly one frame size (no file read). Otherwise, the audio is decoded once and each
-        frame's position is compared with the number of samples before it. (Packet time stamps alone are not enough:
-        mp4 stores a gap as a longer duration of the preceding frame.) '''
+        positions from time stamps equal sample counts. If the codec guarantees a fixed frame size (aac, mp3, alac,
+        flac with a fixed block size; confirmed by the decoded frames), every frame but the last must start exactly one
+        frame size after the one before: checked in the container index if it is complete (e.g. mp4: no file read),
+        else in the time stamps of the packets (e.g. fragmented mp4, mkv, cut-off files: the file is read, but not
+        decoded). A gap or overlap moves the time stamps of the following frames. Otherwise, the audio is decoded once
+        and each frame's position is compared with the number of samples before it. '''
         if self._checked or not self.seekable:
             return self.seekable
         self._checked = True
@@ -845,16 +877,17 @@ class AudioReader(_TagReader):
         tolerance = 1.5 * max(self._ticks, 1) # (coarse time stamps are rounded)
         entries = self.stream.index_entries
         size = _fixed_frame_size(self.stream.codec_context)
-        if (size and size == self._frame_size and self.stream.frames and len(entries) == self.stream.frames):
-            # (complete index, e.g. the sample table of mp4, and a frame size guaranteed by the codec and confirmed by
-            # decoding: a gap or overlap would change the duration of a frame)
-            starts = np.array([e.timestamp for e in entries], dtype=np.float64) * self._ticks
-            ok = bool(np.all(np.abs(np.diff(starts) - size) <= tolerance)) # (all frames but the last)
-        else:
+        fixed = bool(size) and size == self._frame_size # (guaranteed by the codec, and confirmed by decoding)
+        ok = None
+        if fixed and self.stream.frames and len(entries) == self.stream.frames: # complete index (e.g. mp4)
+            ok = _on_grid([e.timestamp for e in entries], self._ticks, size, tolerance)
+        elif fixed:
+            ok = self._check_packet_time_stamps(size, tolerance)
+        if ok is None: # (no fixed frame size, or packets without time stamps)
             ok, counted = True, 0
             self._rewind()
-            for i, frame in enumerate(self.container.decode(self.stream)):
-                if i > 0 and (frame.pts is None or self._pos(frame.pts) != counted):
+            for i, frame in enumerate(self._decode()):
+                if i > 0 and (frame.pts is None or not self._on_time(frame.pts, counted)):
                     ok = False
                     break
                 counted += frame.samples
@@ -866,11 +899,26 @@ class AudioReader(_TagReader):
             self._set_unseekable('gaps or overlaps in the time stamps')
         return ok
 
+    def _check_packet_time_stamps(self, size, tolerance):
+        ''' Whether the packet time stamps lie on the grid of one frame size (see _on_grid), read without decoding.
+        None if packets have no time stamps. '''
+        self._rewind()
+        try:
+            pts = []
+            for packet in self.container.demux(self.stream):
+                if packet.size:
+                    if packet.pts is None:
+                        return None
+                    pts.append(packet.pts)
+            return _on_grid(pts, self._ticks, size, tolerance)
+        finally:
+            self._rewind()
+            self._cursor = None
+
     def _set_unseekable(self, reason):
         if self.seekable:
             self.seekable = False
-            name = self.filename if isinstance(self.filename, (str, os.PathLike)) else 'file-like object'
-            warnings.warn(f'{name}: fast random access is not possible for this audio stream ({reason}). '
+            warnings.warn(f'{self._name}: fast random access is not possible for this audio stream ({reason}). '
                           'Samples are counted while decoding instead: correct, but jumping backwards decodes from the '
                           'start of the file, which can be slow.', stacklevel=3)
 
@@ -1076,7 +1124,7 @@ class AudioReader(_TagReader):
             pos, next_time = 0, self._start_time
             tb, rate = float(self.stream.time_base), self.sample_rate
             self._rewind()
-            for frame in self.container.decode(self.stream):
+            for frame in self._decode():
                 t = next_time if frame.pts is None else frame.pts * tb
                 if not starts and abs(t - self._start_time) * rate < (self._frame_size or frame.samples):
                     t = self._start_time # (time stamp of the first frame before shortening)
@@ -1129,6 +1177,15 @@ def _scalar_or_array(values):
     ''' A Python scalar for 0-d results (int or float), else the array. '''
     values = np.asarray(values)
     return values.item() if values.ndim == 0 else values
+
+
+def _on_grid(timestamps, ticks, size, tolerance):
+    ''' Whether frames with these start time stamps (in ticks of `ticks` samples) follow each other without gaps or
+    overlaps: every frame after the first starts a whole number of frame sizes after the second one (within tolerance,
+    in samples). The first frame is skipped (it can be shortened, e.g. by encoder priming; see AudioReader._calibrate).
+    Compared with the grid, not with the previous frame, so that rounding errors of coarse time stamps cannot add up. '''
+    starts = np.asarray(timestamps[1:], dtype=np.float64) * ticks
+    return bool(np.all(np.abs(starts - starts[0] - np.arange(len(starts)) * size) <= tolerance)) if len(starts) else True
 
 
 def _fixed_frame_size(codec_context):

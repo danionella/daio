@@ -349,13 +349,13 @@ def _sine(rate, seconds, channels=2):
     return np.stack([0.3 * np.sin(2 * np.pi * (300 + 200 * c) * t) for c in range(channels)]).astype(np.float32)
 
 def _write_audio(filename, codec, signal, rate, frame_size=1024, gap=None, container_format=None, extra_streams=(),
-                 container_options=None):
+                 container_options=None, codec_options=None):
     """ Write audio with PyAV (optionally with a gap in the time stamps: (frame number, samples)). Frames have the
     encoder's frame size, if it has one. Returns the frame size. """
     from fractions import Fraction
     layout = 'mono' if signal.shape[0] == 1 else 'stereo'
     with av.open(str(filename), 'w', format=container_format, options=container_options or {}) as container:
-        stream = container.add_stream(codec, rate=rate, layout=layout)
+        stream = container.add_stream(codec, rate=rate, layout=layout, options=codec_options or {})
         stream.codec_context.open()
         frame_size = stream.codec_context.frame_size or frame_size
         fmt = stream.codec_context.format
@@ -508,6 +508,92 @@ def test_audio_reader_checks_time_stamps_without_decoding(tmp_path, monkeypatch)
                 assert np.allclose(audio[end - 5000:end], everything[:, end - 5000:], rtol=0, atol=atol), (codec, ext)
                 assert np.allclose(audio[1000:2000], everything[:, 1000:2000], rtol=0, atol=atol), (codec, ext)
                 assert audio.seekable, (codec, ext)
+
+def test_audio_reader_opens_file_once(tmp_path, monkeypatch):
+    """ Opening a file can be slow (e.g. long fragmented mp4 on a network share): AudioReader opens it once, and goes
+    back to the start by seeking and decoding with a new decoder (also for aac with perceptual noise substitution,
+    whose decoder synthesizes random noise). The first frames must then be those of the file, else it reopens it (e.g.
+    aac in mkv: a new decoder lacks the codec delay of the stream). """
+    import daio.video
+    opened = []
+    original_open = daio.video.av.open
+    def counting_open(*args, **kwargs):
+        opened.append(1)
+        return original_open(*args, **kwargs)
+    monkeypatch.setattr(daio.video.av, 'open', counting_open)
+    rate = 48000
+    signal = _sine(rate, 3, channels=1)
+    fragmented = {'movflags': 'frag_keyframe+empty_moov'}
+    full = tmp_path / 'full.mp3'
+    _write_audio(full, 'libmp3lame', signal, rate)
+    cut = tmp_path / 'cut.mp3' # (packets copied from the middle: the first frames need the bit reservoir before them)
+    with original_open(str(full)) as ic, original_open(str(cut), 'w') as oc:
+        ost = oc.add_stream_from_template(ic.streams.audio[0])
+        for k, packet in enumerate(ic.demux(audio=0)):
+            if k >= 40 and packet.size:
+                packet.stream = ost
+                oc.mux(packet)
+    no_pns = {'aac_pns': '0'} # (as written by VideoWriter)
+    noisy = np.random.default_rng(0).normal(0, 0.1, signal.shape).astype(np.float32) # (aac: noise substitution)
+    cases = [('flac', 'flac.mp4', fragmented, None, True), ('alac', 'alac.m4a', None, None, True),
+             ('flac', 'flac.mkv', None, None, True), ('libmp3lame', 'mp3.mp4', None, None, None), # (PyAV 17: reopens)
+             (None, 'cut.mp3', None, None, None), ('aac', 'aac.mp4', None, no_pns, True),
+             ('aac', 'aac.frag.mp4', fragmented, no_pns, True), ('aac', 'aac_pns.mp4', None, None, True),
+             ('libopus', 'opus.mkv', None, None, None), ('aac', 'aac.mkv', None, no_pns, False)]
+    for codec, name, options, codec_options, once in cases:
+        filename = tmp_path / name
+        if codec:
+            _write_audio(filename, codec, noisy if name == 'aac_pns.mp4' else signal, rate, container_options=options,
+                         codec_options=codec_options)
+        reference = _decode_audio(filename)
+        opened.clear()
+        with AudioReader(filename) as audio:
+            assert len(opened) == 1, name
+            n = audio.nsamples
+            for start in [n // 2, 0, 5000, n - 3000, 0, 100]: # (reads from the start go back to it)
+                expected = reference[:, start:start + 3000]
+                atol = {'aac_pns.mp4': 0.5, 'opus.mkv': 2e-3}.get(name, 0) # (noise synthesis after seeking)
+                assert np.allclose(audio[start:start + 3000], expected, rtol=0, atol=atol), (name, start)
+            assert np.array_equal(audio.read(0, 20000), reference[:, :20000]), name # (from the start: exact)
+            if once is not None:
+                assert (len(opened) == 1) == once, (name, len(opened)) # (else: reopened to read from the start exactly)
+
+def test_audio_reader_never_returns_wrong_samples(tmp_path, monkeypatch):
+    """ Files whose time stamps or decoders cannot be trusted after seeking are read correctly (with a warning), also
+    in rare formats: e.g. RealAudio starting with silence (all time stamps 0: going back to the start by seeking cannot
+    be verified by the first frames alone), decoders with state that a seek loses (adpcm, g.722), opus in ogg (wrong
+    time stamps after seeking into the last page), and reads that end early after a seek. """
+    import daio.video
+    rng = np.random.default_rng(0)
+    cases = [('real_144', 'silent_start.rm', 8000, None), ('adpcm_yamaha', 'yamaha.wav', 48000, None),
+             ('g722', 'g722.wav', 16000, None), ('libopus', 'opus.ogg', 48000, 'ogg')]
+    for codec, name, rate, container_format in cases:
+        signal = np.concatenate([np.zeros((1, int(0.6 * rate)), np.float32), _sine(rate, 2, 1)], axis=1)
+        if codec == 'libopus':
+            signal = signal + 0.1 * rng.normal(size=signal.shape).astype(np.float32)
+        filename = tmp_path / name
+        _write_audio(filename, codec, signal, rate, container_format=container_format)
+        reference = _decode_audio(filename)
+        n = reference.shape[1]
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore')
+            with AudioReader(filename) as audio:
+                assert audio.nsamples == n, name
+                starts = [n // 2, 0, n - 2000, n - 1500, 10, n - 3000] + list(rng.integers(0, n - 1000, 10))
+                for start in starts:
+                    start = int(start)
+                    assert np.array_equal(audio[start:start + 1000], reference[:, start:start + 1000]), (name, start)
+                assert np.array_equal(audio.read(), reference), name
+    # a read that ends early after a seek (time stamps did not match): read again by counting samples
+    filename = tmp_path / 'flac.mkv'
+    _write_audio(filename, 'flac', _sine(48000, 2, 1), 48000)
+    reference = _decode_audio(filename)
+    with AudioReader(filename) as audio:
+        monkeypatch.setattr(audio, '_seek', lambda start: iter(()))
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter('always')
+            assert np.array_equal(audio[50000:52000], reference[:, 50000:52000])
+        assert not audio.seekable and any('do not match' in str(w.message) for w in caught)
 
 def test_audio_video_time_mapping(tmp_path):
     """ Audio samples and video frames map to each other through time (seconds on the same clock), for scalars and

@@ -421,11 +421,13 @@ def test_audio_reader(tmp_path):
         assert audio.read_time(t[10], t[11]).shape == (2, rate // 25)
 
 def test_audio_reader_gap_in_time_stamps(tmp_path):
-    """ Sample i is the i-th decoded sample, also if the time stamps have a gap (e.g. dropped audio): random access
-    then counts decoded samples (with a warning), instead of trusting the time stamps. """
+    """ Sample i is the i-th decoded sample, also if the time stamps have a gap (e.g. dropped audio) or overlap: random
+    access then counts decoded samples (with a warning), instead of trusting the time stamps. """
     rate = 48000
     signal = _sine(rate, 2, channels=1)
-    for name, gap in [('gap.mp4', (10, 12000)), ('gap.mkv', (10, 12000)), ('no_gap.mkv', None)]:
+    cases = [('gap.mp4', (10, 12000)), ('gap.mkv', (10, 12000)), ('overlap.mp4', (10, -3000)),
+             ('overlap.mkv', (10, -3000)), ('no_gap.mkv', None)]
+    for name, gap in cases:
         filename = tmp_path / name
         frame_size = _write_audio(filename, 'flac', signal, rate, gap=gap) # e.g. 12000 samples missing after frame 10
         reference = _decode_audio(filename)
@@ -437,7 +439,7 @@ def test_audio_reader_gap_in_time_stamps(tmp_path):
                     assert np.array_equal(audio[start:start + 3000], reference[:, start:start + 3000]), (name, start)
                 assert np.array_equal(audio.read(), reference), name
                 assert audio.seekable == (gap is None), name
-        assert any('gaps in the time stamps' in str(w.message) for w in caught) == (gap is not None), name
+        assert any('overlaps in the time stamps' in str(w.message) for w in caught) == (gap is not None), name
 
 def test_reader_stream_selection(tmp_path):
     """ VideoReader and AudioReader read a selected stream: by stream index, or by handler_name. """

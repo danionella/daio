@@ -656,9 +656,9 @@ class AudioReader(_TagReader):
     Samples are returned as float32 arrays of shape (channels, samples), scaled to [-1, 1]. Sample index i is the i-th
     sample of a sequential decode from the start of the stream (no samples skipped or added), and `reader[a:b]`
     returns the same samples as reading sequentially. Fast random access uses the time stamps of the file; before the
-    first random access, they are checked for gaps (using the container index if complete, else by reading the
-    packets of the file once, without decoding). Files with gaps or unusable time stamps are read by counting decoded
-    samples instead, with a warning: still correct, but jumping backwards decodes from the start of the file.
+    first random access, they are checked for gaps and overlaps (using the container index if complete, else by
+    decoding the stream once). Files with gaps, overlaps or unusable time stamps are read by counting decoded samples
+    instead, with a warning: still correct, but jumping backwards decodes from the start of the file.
 
     Random access starts decoding a little before the requested position and discards that run-in: uncompressed and
     lossless audio (e.g. wav, flac) and mp3 are bit-exact; aac and opus decoders synthesize noise, so samples after a
@@ -777,7 +777,7 @@ class AudioReader(_TagReader):
             if ok:
                 self._nsamples = counted
         if not ok:
-            self._set_unseekable('gaps in the time stamps')
+            self._set_unseekable('gaps or overlaps in the time stamps')
         return ok
 
     def _set_unseekable(self, reason):

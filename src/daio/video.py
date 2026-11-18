@@ -772,21 +772,23 @@ class AudioReader(_TagReader):
             self.filename.seek(0)
         self.container = av.open(self.filename)
         self.stream = _find_stream(self.container, self._stream_spec, 'audio')
+        self._decoder = self.stream.codec_context
 
     def _rewind(self):
-        ''' Go back to the start of the stream: by seeking (cheap), else by reopening the file (which reads the header
-        and index again: slow e.g. for long fragmented mp4 on network shares). Seeking is used only for decoders without
-        random state (not e.g. aac, opus or ac3, which synthesize noise or dither: their samples after a seek can differ
-        from those of a sequential decode). Seeking to the start can also skip the first frame (e.g. opus in mkv), and
-        decoders can carry state from earlier frames (e.g. the mp3 bit reservoir), so the first frames decoded after it
-        (about 0.2 s, as decoded on opening) are compared with those of the file, and the file is reopened if they
-        differ (see _decode). '''
+        ''' Go back to the start of the stream, so that decoding gives the same samples as after opening the file: by
+        seeking to the start and decoding with a new decoder (a decoder carries state from earlier frames, e.g. the mp3
+        bit reservoir, or the random noise of aac with perceptual noise substitution), else by reopening the file (which
+        reads the header and index again: slow e.g. for long fragmented mp4 on network shares). A new decoder does not
+        get all parameters of the stream (e.g. the codec delay of aac in mkv, or the block size of adpcm), and seeking
+        can skip a frame, so the first frames decoded after rewinding (about 0.2 s, as decoded on opening) are compared
+        with those of the file, and the file is reopened if they differ (see _decode). '''
         self._release()
         if self._start is None:
             return self._open()
         try:
             self.container.seek(self._start[0], backward=True, stream=self.stream)
-        except av.FFmpegError:
+            self._decoder = _new_decoder(self.stream)
+        except (av.FFmpegError, ValueError, TypeError, AttributeError):
             return self._open()
         self._verify_start = True
 
@@ -800,6 +802,7 @@ class AudioReader(_TagReader):
         ''' Seek (backward) to a time stamp of the stream, for random access. '''
         self._release()
         self.container.seek(timestamp, backward=True, stream=self.stream)
+        self._decoder.flush_buffers() # (a decoder made by _rewind is not flushed by seeking)
 
     def _decode(self):
         ''' Decode from the current position. Undecodable damaged packets (e.g. the last one of a cut-off recording)
@@ -819,7 +822,7 @@ class AudioReader(_TagReader):
     def _decode_packets(self):
         for packet in self.container.demux(self.stream):
             try:
-                frames = packet.decode()
+                frames = self._decoder.decode(packet if packet.size else None) # (an empty packet: end of the stream)
             except av.InvalidDataError:
                 if not packet.is_corrupt:
                     raise
@@ -884,7 +887,7 @@ class AudioReader(_TagReader):
             if len(frames) >= n_frames:
                 break
         frames, signatures = frames[:n_frames], signatures[:n_frames]
-        if first_ts is not None and signatures and _deterministic_decoder(self.stream.codec_context.name):
+        if first_ts is not None and signatures:
             self._start = (first_ts, signatures)
         self._release()
         if not frames:
@@ -1303,10 +1306,23 @@ def _fixed_frame_size(codec_context):
     return None
 
 
-def _deterministic_decoder(codec_name):
-    ''' Whether an audio decoder gives the same samples however it is reached (no synthesized noise or dither). '''
-    return codec_name.startswith(('pcm_', 'adpcm_')) or codec_name in (
-        'flac', 'alac', 'mp3', 'mp3float', 'mp2', 'mp2float', 'wavpack', 'tta', 'ape')
+def _new_decoder(stream):
+    ''' A new decoder for an audio stream (with the parameters PyAV can set). '''
+    cc = stream.codec_context
+    decoder = av.CodecContext.create(cc.name, 'r')
+    decoder.extradata = cc.extradata
+    decoder.sample_rate = cc.sample_rate
+    decoder.layout = cc.layout
+    optional = dict(pkt_timebase=stream.time_base, bits_per_raw_sample=getattr(cc, 'bits_per_raw_sample', None),
+                    bit_rate=cc.bit_rate)
+    for name, value in optional.items():
+        if value:
+            try:
+                setattr(decoder, name, value)
+            except AttributeError: # (not settable in older PyAV versions)
+                pass
+    decoder.open()
+    return decoder
 
 
 def _frame_signature(frame):

@@ -459,35 +459,48 @@ def test_audio_reader_gap_in_time_stamps(tmp_path):
         messages = [str(w.message) for w in caught]
         assert (any(warning in m for m in messages) if warning else not messages), (name, messages)
 
-def test_audio_reader_checks_time_stamps_without_decoding(tmp_path):
+def test_audio_reader_checks_time_stamps_without_decoding(tmp_path, monkeypatch):
     """ Codecs with a guaranteed frame size (aac, mp3, alac, flac with a fixed block size) are checked for gaps without
-    decoding: using the sample table of mp4, else the packet time stamps (fragmented mp4, mkv); gaps are found there
-    too. Cut-off recordings are read up to the damaged end. """
+    decoding: using the container index if it is complete (mp4, also fragmented and cut off; reading at most the end of
+    the file), else the packet time stamps (mkv, or a fragmented mp4 whose index is only partly loaded on opening);
+    gaps are found either way. Cut-off recordings are read up to the damaged end. """
+    import daio.video
+    scanned = []
+    original = daio.video.AudioReader._check_packet_time_stamps
+    def spy(self, *args):
+        scanned.append(1)
+        return original(self, *args)
+    monkeypatch.setattr(daio.video.AudioReader, '_check_packet_time_stamps', spy)
     rate = 48000
     signal = _sine(rate, 2, channels=1)
     fragmented = {'movflags': 'frag_keyframe+empty_moov'}
+    partly_indexed = {'movflags': 'delay_moov+default_base_moof+global_sidx', 'frag_duration': '200000'}
     cases = [(codec, ext, options) for codec in ['aac', 'alac', 'flac', 'libmp3lame']
-             for ext, options in [('mp4', None), ('frag.mp4', fragmented), ('mkv', None)]
+             for ext, options in [('mp4', None), ('frag.mp4', fragmented), ('sidx.mp4', partly_indexed), ('mkv', None)]
              if not (codec == 'alac' and ext == 'mkv')]
     for codec, ext, options in cases:
         for gap in [None, (10, 3000)]:
             filename = tmp_path / f'{codec}_{gap is not None}.{ext}'
             _write_audio(filename, codec, signal, rate, gap=gap, container_options=options)
+            scanned.clear()
             with warnings.catch_warnings(record=True) as caught:
                 warnings.simplefilter('always')
                 with AudioReader(filename) as audio:
                     assert audio._check_time_stamps() == (gap is None), (codec, ext)
                     assert audio._nsamples is None, (codec, ext) # (not decoded: the whole stream would have been counted)
+                    assert bool(scanned) == (ext in ('mkv', 'sidx.mp4')), (codec, ext) # (else: from the index)
             assert any('overlaps in the time stamps' in str(w.message) for w in caught) == (gap is not None), (codec, ext)
         # a cut-off recording: read up to the damaged end, with a warning
         cut = tmp_path / f'{codec}_cut.{ext}'
         data = (tmp_path / f'{codec}_False.{ext}').read_bytes()
         cut.write_bytes(data[:len(data) * 7 // 10])
-        if ext == 'mp4':
+        if ext != 'frag.mp4' and ext != 'mkv':
             continue # (an mp4 cut off before its index at the end cannot be opened)
+        scanned.clear()
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter('always')
             with AudioReader(cut) as audio:
+                assert audio._check_time_stamps() and bool(scanned) == (ext == 'mkv'), (codec, ext)
                 everything = audio.read()
                 assert audio.nsamples == everything.shape[1] > 0, (codec, ext)
                 end = audio.nsamples

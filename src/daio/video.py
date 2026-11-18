@@ -862,9 +862,9 @@ class AudioReader(_TagReader):
         ''' Check (once, before the first random access) that the time stamps have no gaps or overlaps, so that
         positions from time stamps equal sample counts. If the codec guarantees a fixed frame size (aac, mp3, alac,
         flac with a fixed block size; confirmed by the decoded frames), every frame but the last must start exactly one
-        frame size after the one before: checked in the container index if it is complete (e.g. mp4: no file read),
-        else in the time stamps of the packets (e.g. fragmented mp4, mkv, cut-off files: the file is read, but not
-        decoded). A gap or overlap moves the time stamps of the following frames. Otherwise, the audio is decoded once
+        frame size after the one before: checked in the container index if it is complete (e.g. mp4, also fragmented or
+        cut off: see _complete_index; at most the end of the file is read), else in the time stamps of the packets
+        (e.g. mkv: the file is read, but not decoded). A gap or overlap moves the time stamps of the following frames. Otherwise, the audio is decoded once
         and each frame's position is compared with the number of samples before it. '''
         if self._checked or not self.seekable:
             return self.seekable
@@ -875,14 +875,15 @@ class AudioReader(_TagReader):
             self._set_unseekable('time stamps of this codec in ogg files are unreliable after seeking')
             return False
         tolerance = 1.5 * max(self._ticks, 1) # (coarse time stamps are rounded)
-        entries = self.stream.index_entries
         size = _fixed_frame_size(self.stream.codec_context)
         fixed = bool(size) and size == self._frame_size # (guaranteed by the codec, and confirmed by decoding)
         ok = None
-        if fixed and self.stream.frames and len(entries) == self.stream.frames: # complete index (e.g. mp4)
-            ok = _on_grid([e.timestamp for e in entries], self._ticks, size, tolerance)
-        elif fixed:
-            ok = self._check_packet_time_stamps(size, tolerance)
+        if fixed:
+            starts = self._complete_index()
+            if starts is not None: # (e.g. mp4, also fragmented)
+                ok = _on_grid(starts, self._ticks, size, tolerance)
+            else: # (e.g. mkv: reads the file, without decoding)
+                ok = self._check_packet_time_stamps(size, tolerance)
         if ok is None: # (no fixed frame size, or packets without time stamps)
             ok, counted = True, 0
             self._rewind()
@@ -898,6 +899,52 @@ class AudioReader(_TagReader):
         if not ok:
             self._set_unseekable('gaps or overlaps in the time stamps')
         return ok
+
+    def _complete_index(self):
+        ''' Time stamps of all packets from the container index, if it is known to be complete (else None). With a frame
+        count in the header (e.g. mp4), the index must have one entry per frame. Without one (e.g. fragmented mp4, whose
+        frame tables FFmpeg reads on opening, unless it reads only some of them, e.g. with a global sidx), entries
+        beyond the end of the file are dropped (cut-off recordings), and the packets at the end of the file must be
+        exactly the last entries (only the end of the file is read; see _index_tail_matches). '''
+        entries = self.stream.index_entries
+        n = self.stream.frames
+        if n:
+            return [e.timestamp for e in entries] if len(entries) == n else None
+        file_size = getattr(self.container, 'size', None)
+        rows = [(e.timestamp, e.pos) for e in entries
+                if e.pos >= 0 and (not file_size or file_size <= 0 or e.pos + e.size <= file_size)]
+        if not rows or not self._index_tail_matches(rows):
+            return None
+        return [ts for ts, _ in rows]
+
+    def _index_tail_matches(self, rows, n_last=8):
+        ''' Whether the packets from the n_last-th last index entry to the end of the file are exactly the last entries
+        (by file position, in order), followed by nothing but damaged packets (cut-off recordings). An index that misses
+        packets (partly loaded, or e.g. key frames only) does not match. '''
+        k = max(len(rows) - n_last, 0)
+        index_of = {pos: i for i, (_, pos) in enumerate(rows)}
+        expected = None # index entry of the next packet
+        try:
+            self.container.seek(int(rows[k][0]), backward=True, stream=self.stream)
+            for packet in self.container.demux(self.stream):
+                if not packet.size:
+                    continue
+                if expected is None: # first packet after the seek: must be in the index, at or before entry k
+                    expected = index_of.get(packet.pos)
+                    if expected is None or expected > k:
+                        return False
+                if expected < len(rows):
+                    if packet.pos != rows[expected][1]:
+                        return False
+                    expected += 1
+                elif not packet.is_corrupt: # more packets than the index lists
+                    return False
+        except av.FFmpegError:
+            return False
+        finally:
+            self._rewind()
+            self._cursor = None
+        return expected == len(rows)
 
     def _check_packet_time_stamps(self, size, tolerance):
         ''' Whether the packet time stamps lie on the grid of one frame size (see _on_grid), read without decoding.

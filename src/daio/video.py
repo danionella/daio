@@ -367,11 +367,11 @@ class VideoReader(_TagReader):
 
         Args:
             time (float or array): time(s) in seconds
-            rounding: 'round' (default): the frame with the nearest time (-1 or nframes for times more than half a
-                frame interval before the first or after the last frame). 'floor': the frame shown at that time, i.e.
-                the last frame at or before it (-1 for times before the first frame; the last frame for times after
-                it). 'ceil': the first frame at or after that time (nframes for times after the last frame). None: a
-                fractional index, interpolated between frame times (extrapolated beyond the first and last frame).
+            rounding: 'round' (default): the frame with the nearest time (nframes for times more than half a frame
+                interval after the last frame). 'floor': the frame shown at that time, i.e. the last frame at or before
+                it (the last frame for times after it). 'ceil': the first frame at or after that time (nframes for times
+                after the last frame). Integer results are never negative: times before the first frame give 0. None:
+                a fractional index, interpolated between frame times (extrapolated beyond the first and last frame).
         Returns:
             int or array of int (float for rounding=None)
         '''
@@ -387,8 +387,7 @@ class VideoReader(_TagReader):
         elif rounding == 'round':
             lo, hi = np.clip(floor, 0, len(times) - 1), np.clip(floor + 1, 0, len(times) - 1)
             index = np.where(np.abs(t - times[hi]) <= np.abs(t - times[lo]), hi, lo)
-            if len(times) > 1: # (outside the frames by more than half a frame interval: no nearest frame)
-                index = np.where(t < times[0] - (times[1] - times[0]) / 2 - _TIME_TOLERANCE, -1, index)
+            if len(times) > 1: # (after the last frame by more than half a frame interval: no nearest frame)
                 index = np.where(t >= times[-1] + (times[-1] - times[-2]) / 2 - _TIME_TOLERANCE, len(times), index)
         elif rounding is None:
             if len(times) < 2:
@@ -397,6 +396,8 @@ class VideoReader(_TagReader):
             index = k + (t - times[k]) / (times[k + 1] - times[k])
         else:
             raise ValueError(f"rounding must be 'floor', 'ceil', 'round' or None, not {rounding!r}")
+        if rounding is not None:
+            index = np.maximum(index, 0) # (never negative: -1 would index the last frame)
         return _scalar_or_array(index)
 
     def read(self):

@@ -558,6 +558,43 @@ def test_audio_reader_opens_file_once(tmp_path, monkeypatch):
             if once is not None:
                 assert (len(opened) == 1) == once, (name, len(opened)) # (else: reopened to read from the start exactly)
 
+def test_audio_reader_never_returns_wrong_samples(tmp_path, monkeypatch):
+    """ Files whose time stamps or decoders cannot be trusted after seeking are read correctly (with a warning), also
+    in rare formats: e.g. RealAudio starting with silence (all time stamps 0: going back to the start by seeking cannot
+    be verified by the first frames alone), decoders with state that a seek loses (adpcm, g.722), opus in ogg (wrong
+    time stamps after seeking into the last page), and reads that end early after a seek. """
+    import daio.video
+    rng = np.random.default_rng(0)
+    cases = [('real_144', 'silent_start.rm', 8000, None), ('adpcm_yamaha', 'yamaha.wav', 48000, None),
+             ('g722', 'g722.wav', 16000, None), ('libopus', 'opus.ogg', 48000, 'ogg')]
+    for codec, name, rate, container_format in cases:
+        signal = np.concatenate([np.zeros((1, int(0.6 * rate)), np.float32), _sine(rate, 2, 1)], axis=1)
+        if codec == 'libopus':
+            signal = signal + 0.1 * rng.normal(size=signal.shape).astype(np.float32)
+        filename = tmp_path / name
+        _write_audio(filename, codec, signal, rate, container_format=container_format)
+        reference = _decode_audio(filename)
+        n = reference.shape[1]
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore')
+            with AudioReader(filename) as audio:
+                assert audio.nsamples == n, name
+                starts = [n // 2, 0, n - 2000, n - 1500, 10, n - 3000] + list(rng.integers(0, n - 1000, 10))
+                for start in starts:
+                    start = int(start)
+                    assert np.array_equal(audio[start:start + 1000], reference[:, start:start + 1000]), (name, start)
+                assert np.array_equal(audio.read(), reference), name
+    # a read that ends early after a seek (time stamps did not match): read again by counting samples
+    filename = tmp_path / 'flac.mkv'
+    _write_audio(filename, 'flac', _sine(48000, 2, 1), 48000)
+    reference = _decode_audio(filename)
+    with AudioReader(filename) as audio:
+        monkeypatch.setattr(audio, '_seek', lambda start: iter(()))
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter('always')
+            assert np.array_equal(audio[50000:52000], reference[:, 50000:52000])
+        assert not audio.seekable and any('do not match' in str(w.message) for w in caught)
+
 def test_audio_video_time_mapping(tmp_path):
     """ Audio samples and video frames map to each other through time (seconds on the same clock), for scalars and
     arrays, with selectable rounding; also for audio with a gap in the time stamps. """

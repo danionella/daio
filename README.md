@@ -54,6 +54,14 @@ Indexing is frame-accurate: `reader[i]` returns the same frame as the i-th frame
 
 Every seek is verified (the frame must come from the expected position in the file, decoded time stamps must increase, and decoding must start at a real key frame). Some files cannot be seeked reliably, e.g. avi files with B-frames, files with duplicate time stamps, or intra-refresh streams. For those, `VideoReader` warns and switches to sequential decoding (`reader.seekable` becomes `False`): frames are still returned correctly, but jumping backwards decodes from the start of the file, which can be slow. Transcoding such files (e.g. `ffmpeg -i input.avi -c:v libx264 -pix_fmt yuv420p output.mp4`) makes them fast to seek again.
 
+Read metadata tags (e.g. recording settings stored by the recording software):
+```python
+reader.list_tags()  # {'container': {...}, 'streams': {0: {...}}}
+settings = reader.read_tag('recav_settings')  # JSON values are parsed (here: a dict)
+reader.read_tag('handler_name', stream=0)  # a stream's tag (stream index or handler_name)
+```
+Which tags a file keeps depends on the container: mp4 keeps custom container tags only if written with `movflags=use_metadata_tags`, mkv stores tag names in upper case (`read_tag` ignores case), and avi drops custom tags.
+
 Note on precision: video encoding is lossy by default (`crf=23`). Grayscale frames are stored in the luma channel of `yuv420p` video, which uses the limited range 16-235, so even lossless settings (`crf=0`) can change gray values by ±1. If you need exact values, store the data in HDF5 instead, or encode RGB frames losslessly with e.g. `VideoWriter(path, codec='libx264rgb', pix_fmt='rgb24', crf=0)`.
 
 You can also use with statements to handle file closure:

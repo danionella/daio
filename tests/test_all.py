@@ -394,7 +394,7 @@ def test_audio_reader(tmp_path):
     with VideoWriter(video, fps=25, frame_shape=(64, 96), audio_rate=rate, audio_channels=2) as writer:
         writer.write_audio(signal)
         writer.write_frames(_ramp_frames(75))
-    files['with_video.mp4'] = ('aac', 2e-3)
+    files['with_video.mp4'] = ('aac', 0) # (VideoWriter disables aac noise substitution)
     for name, (codec, tolerance) in files.items():
         reference = _decode_audio(tmp_path / name)
         for source in [tmp_path / name, io.BytesIO((tmp_path / name).read_bytes())]:
@@ -421,25 +421,37 @@ def test_audio_reader(tmp_path):
         assert audio.read_time(t[10], t[11]).shape == (2, rate // 25)
 
 def test_audio_reader_gap_in_time_stamps(tmp_path):
-    """ Sample i is the i-th decoded sample, also if the time stamps have a gap (e.g. dropped audio) or overlap: random
-    access then counts decoded samples (with a warning), instead of trusting the time stamps. """
+    """ Sample i is the i-th decoded sample, also if the time stamps have a gap (e.g. dropped audio) or overlap, or are
+    unreliable after seeking (flac in ogg): random access then counts decoded samples (with a warning), instead of
+    trusting the time stamps. """
     rate = 48000
     signal = _sine(rate, 2, channels=1)
-    cases = [('gap.mp4', (10, 12000)), ('gap.mkv', (10, 12000)), ('overlap.mp4', (10, -3000)),
-             ('overlap.mkv', (10, -3000)), ('no_gap.mkv', None)]
-    for name, gap in cases:
+    cases = [ # name, codec, gap (frame number, samples), expected warning
+        ('gap.mp4', 'flac', (10, 12000), 'overlaps in the time stamps'),
+        ('gap.mkv', 'flac', (10, 12000), 'overlaps in the time stamps'),
+        ('overlap.mp4', 'flac', (10, -3000), 'overlaps in the time stamps'),
+        ('overlap.mkv', 'flac', (10, -3000), 'overlaps in the time stamps'),
+        ('gap_before_last_frame.mp4', 'libmp3lame', (96000 // 1152, 5000), 'overlaps in the time stamps'),
+        ('gap_after_first_frame.mkv', 'flac', (1, 4800), 'gap or overlap after the first frame'),
+        ('flac.ogg', 'flac', None, 'unreliable after seeking'),
+        ('no_gap.mkv', 'flac', None, None)]
+    for name, codec, gap, warning in cases:
         filename = tmp_path / name
-        frame_size = _write_audio(filename, 'flac', signal, rate, gap=gap) # e.g. 12000 samples missing after frame 10
+        frame_size = _write_audio(filename, codec, signal, rate, gap=gap)
         reference = _decode_audio(filename)
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter('always')
             with AudioReader(filename) as audio:
-                assert audio.nsamples == reference.shape[1] == signal.shape[1], name # no samples lost or added
+                assert audio.nsamples == len(audio) == reference.shape[1] == signal.shape[1], name # none lost or added
                 for start in [100, 10 * frame_size - 300, 10 * frame_size + 5000, 70000, 20000, audio.nsamples - 3000]:
                     assert np.array_equal(audio[start:start + 3000], reference[:, start:start + 3000]), (name, start)
+                assert np.array_equal(audio[-1], reference[:, -1]), name
+                chunks = [audio.read(i, i + 4000) for i in range(0, audio.nsamples, 4000)]
+                assert np.array_equal(np.concatenate(chunks, axis=1), reference), name
                 assert np.array_equal(audio.read(), reference), name
-                assert audio.seekable == (gap is None), name
-        assert any('overlaps in the time stamps' in str(w.message) for w in caught) == (gap is not None), name
+                assert audio.seekable == (warning is None), name
+        messages = [str(w.message) for w in caught]
+        assert (any(warning in m for m in messages) if warning else not messages), (name, messages)
 
 def test_reader_stream_selection(tmp_path):
     """ VideoReader and AudioReader read a selected stream: by stream index, or by handler_name. """

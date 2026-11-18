@@ -657,12 +657,15 @@ class AudioReader(_TagReader):
     sample of a sequential decode from the start of the stream (no samples skipped or added), and `reader[a:b]`
     returns the same samples as reading sequentially. Fast random access uses the time stamps of the file; before the
     first random access, they are checked for gaps and overlaps (using the container index if complete, else by
-    decoding the stream once). Files with gaps, overlaps or unusable time stamps are read by counting decoded samples
-    instead, with a warning: still correct, but jumping backwards decodes from the start of the file.
+    decoding the stream once). Files with gaps, overlaps or unusable time stamps (also flac and vorbis in ogg files,
+    whose time stamps are unreliable after seeking) are read by counting decoded samples instead, with a warning:
+    still correct, but jumping backwards decodes from the start of the file.
 
     Random access starts decoding a little before the requested position and discards that run-in: uncompressed and
-    lossless audio (e.g. wav, flac) and mp3 are bit-exact; aac and opus decoders synthesize noise, so samples after a
-    seek can differ from a sequential decode by tiny amounts (up to about 1e-3 for aac, 1e-4 for opus).
+    lossless audio (e.g. wav, flac) and mp3 are bit-exact. Some lossy decoders synthesize noise or dither, so samples
+    after a seek can differ from a sequential decode: aac with perceptual noise substitution (used by FFmpeg's aac
+    encoder by default, but not by VideoWriter) replaces noise-like bands with random noise of the same energy, so
+    differences can be as large as that noise; opus differs by up to about 1e-4, ac3 by up to about 0.03.
 
     Args:
         filename (str or file-like): path to the file
@@ -738,7 +741,9 @@ class AudioReader(_TagReader):
         ref = min(1, len(frames) - 1) # the first frame may be shortened: calibrate on the second one
         counted = [sum(n for _, n in frames[:i]) for i in range(len(frames))]
         raw = [pts * self._ticks for pts, _ in frames]
-        self._start_time = float(frames[ref][0] * self.stream.time_base) - counted[ref] / self.sample_rate
+        tb = float(self.stream.time_base)
+        starts = [pts * tb - counted[i] / self.sample_rate for i, (pts, _) in enumerate(frames)][ref:]
+        self._start_time = starts[0]
         if self._ticks <= 1: # time stamps resolve single samples
             self._offset = counted[ref] - round(raw[ref])
         else:
@@ -746,8 +751,14 @@ class AudioReader(_TagReader):
             if any(n != size for _, n in frames[ref:-1]):
                 return self._set_unseekable('coarse time stamps and varying frame sizes')
             self._grid = (counted[ref], size, raw[ref])
+            if ref and frames[0][1] == size: # (a first frame of full size is not shortened: its time stamp counts too)
+                starts.append(frames[0][0] * tb)
+            lo, hi = max(starts) - tb / 2, min(starts) + tb / 2 # (time stamps are rounded to the nearest tick)
+            self._start_time = (lo + hi) / 2 if lo <= hi else float(np.mean(starts))
         if any(self._pos(frames[i][0]) != counted[i] for i in range(ref, len(frames))):
             return self._set_unseekable('irregular time stamps')
+        if abs(self._pos(frames[0][0])) >= frames[ref][1]: # more than a shortened first frame
+            return self._set_unseekable('gap or overlap after the first frame')
 
     def _check_time_stamps(self):
         ''' Check (once, before the first random access) that the time stamps have no gaps, so that positions from
@@ -758,12 +769,17 @@ class AudioReader(_TagReader):
         if self._checked or not self.seekable:
             return self.seekable
         self._checked = True
+        if self.container.format.name == 'ogg' and self.stream.codec_context.name != 'opus':
+            # (after seeking, FFmpeg can assign wrong time stamps to the first packets of an ogg page, e.g. for flac and
+            # vorbis, whose packet durations it cannot know from the packets alone)
+            self._set_unseekable('time stamps of this codec in ogg files are unreliable after seeking')
+            return False
         tolerance = 1.5 * max(self._ticks, 1) # (coarse time stamps are rounded)
         entries = self.stream.index_entries
         size = self.stream.codec_context.frame_size
         if size and self.stream.frames and len(entries) == self.stream.frames: # (e.g. mp4: complete sample table)
             starts = np.array([e.timestamp for e in entries], dtype=np.float64) * self._ticks
-            ok = bool(np.all(np.abs(np.diff(starts)[:-1] - size) <= tolerance))
+            ok = bool(np.all(np.abs(np.diff(starts) - size) <= tolerance)) # (all frames but the last)
         else:
             ok, counted = True, 0
             self._rewind()
@@ -783,19 +799,23 @@ class AudioReader(_TagReader):
     def _set_unseekable(self, reason):
         if self.seekable:
             self.seekable = False
-            warnings.warn(f'{self.filename}: fast random access is not possible for this audio stream ({reason}). '
+            name = self.filename if isinstance(self.filename, (str, os.PathLike)) else 'file-like object'
+            warnings.warn(f'{name}: fast random access is not possible for this audio stream ({reason}). '
                           'Samples are counted while decoding instead: correct, but jumping backwards decodes from the '
                           'start of the file, which can be slow.', stacklevel=3)
 
     @property
     def nsamples(self):
-        ''' Number of samples per channel (exact; the end of the stream is decoded once to determine it). '''
+        ''' Number of samples per channel (exact: determined by decoding the end of the stream, or, if needed, the whole
+        stream once). '''
         if self._nsamples is None:
             self._nsamples = self._count_samples()
         return self._nsamples
 
     def _count_samples(self):
-        if self.stream.duration and self._check_time_stamps():
+        if self._check_time_stamps() and self._nsamples is not None: # (counted while checking)
+            return self._nsamples
+        if self.stream.duration and self.seekable:
             end = (self.stream.start_time or 0) + self.stream.duration
             run_in = int(self.RUN_IN / self.stream.time_base)
             try:
@@ -835,8 +855,12 @@ class AudioReader(_TagReader):
         out = np.zeros((self.channels, max(stop - start, 0)), dtype=np.float32)
         if stop <= start:
             return out
-        if self._cursor is not None and self._cursor[0] == start: # continue where the last read ended
-            frames, pending = self._cursor[1], self._cursor[2]
+        expected = None
+        cursor = self._cursor
+        if cursor is not None and cursor[0] <= start and (cursor[0] == start or not self.seekable
+                                                         or start - cursor[0] <= self.RUN_IN * self.sample_rate):
+            frames, pending = cursor[1], cursor[2] # continue where the last read ended (also for small forward jumps)
+            expected = cursor[0] if pending is None else None
         elif self._check_time_stamps():
             frames, pending = self._seek(start), None
             if frames is None: # time stamps turned out to be irregular
@@ -844,7 +868,7 @@ class AudioReader(_TagReader):
         else:
             self._rewind()
             frames, pending = self._counted(self._frames()), None
-        filled, expected = 0, None
+        filled = 0
         source = _chain_pending(pending, frames)
         for pos, data in source:
             if expected is not None and pos != expected:
@@ -930,7 +954,7 @@ class AudioReader(_TagReader):
                 return self.read(start, stop)
             lo, hi = (start, stop) if step > 0 else (stop + 1, start + 1)
             return self.read(lo, hi)[:, start - lo::step] if hi > lo else np.zeros((self.channels, 0), np.float32)
-        raise IndexError(f'audio samples can be indexed with integers or slices, not {index!r}')
+        raise TypeError(f'audio samples can be indexed with integers or slices, not {index!r}')
 
     def __len__(self):
         return self.nsamples
@@ -980,6 +1004,8 @@ def _find_stream(container, stream=None, kind=None):
             raise ValueError(f'the file has no {kind} stream')
         return candidates[0]
     if isinstance(stream, (int, np.integer)) and not isinstance(stream, bool):
+        if not 0 <= int(stream) < len(container.streams):
+            raise IndexError(f'no stream {int(stream)}: the file has {len(container.streams)} streams')
         found = container.streams[int(stream)]
         if kind is not None and found.type != kind:
             raise ValueError(f'stream {int(stream)} is a {found.type} stream, not a {kind} stream')
@@ -1097,7 +1123,9 @@ class VideoWriter:
                              'to VideoWriter().')
         self.channel_layout = 'mono' if channels == 1 else 'stereo'
         if stream_args is None:
-            stream_args = dict(codec_name='aac', rate=audio_rate, layout=self.channel_layout)
+            # (no perceptual noise substitution: the decoder would synthesize random noise, which differs between a
+            # sequential decode and a decode after seeking)
+            stream_args = dict(codec_name='aac', rate=audio_rate, layout=self.channel_layout, options={'aac_pns': '0'})
         self.audio_stream = self.container.add_stream(**stream_args)
         self.audio_rate = audio_rate
         self.audio_channels = channels

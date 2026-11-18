@@ -104,23 +104,62 @@ class VideoReader:
         return ok
 
     def _container_index(self):
-        ''' Read the container index (no file scan). Returns (timestamps, is_keyframe, is_discard, pos) arrays, or None if the
-        index is not complete (e.g. mkv/ts, fragmented mp4, avi with frame count mismatch). Timestamps are decode time
-        stamps (dts) in units of stream.time_base. '''
+        ''' Read the container index (no file scan). Returns (timestamps, is_keyframe, is_discard, pos, verified) or None
+        if there is no usable index (e.g. mkv/ts: key frames only, avi with frame count mismatch). Timestamps are decode
+        time stamps (dts) in units of stream.time_base. verified is True if the index length matches the frame count in
+        the header. Without a frame count (e.g. fragmented mp4), the index needs to be checked (_index_tail_matches);
+        entries beyond the end of the file (cut-off recordings) are dropped. '''
         n = self.stream.frames
         entries = self.stream.index_entries
-        if not n or len(entries) != n:
+        if not len(entries) or (n and len(entries) != n):
             return None
-        rows = [(e.timestamp, e.pos, e.is_keyframe, e.is_discard) for e in entries]
-        ts, pos, kf, discard = (np.array(col) for col in zip(*rows))
-        return ts.astype(np.int64), kf.astype(bool), discard.astype(bool), pos.astype(np.int64)
+        rows = [(e.timestamp, e.pos, e.is_keyframe, e.is_discard, e.size) for e in entries]
+        ts, pos, kf, discard, size = (np.array(col) for col in zip(*rows))
+        if not n: # no frame count: only a complete per-frame index can be used (not a key-frames-only index)
+            if kf.all():
+                return None
+            file_size = getattr(self.container, 'size', None)
+            if file_size is not None and file_size > 0:
+                inside = pos + size <= file_size
+                ts, kf, discard, pos = ts[inside], kf[inside], discard[inside], pos[inside]
+                if not kf.any():
+                    return None
+        return ts.astype(np.int64), kf.astype(bool), discard.astype(bool), pos.astype(np.int64), bool(n)
+
+    def _index_tail_matches(self, ts, kf, pos):
+        ''' Check an index without frame count: the packets from its last key frame to the end of the file must be
+        exactly its last entries (by file position, in order), followed by nothing but damaged packets (cut-off
+        recordings). Only packets are read, no frames decoded; stops at the first mismatch. '''
+        k = int(np.flatnonzero(kf)[-1])
+        index_of = {int(p): i for i, p in enumerate(pos)}
+        expected = None # index entry of the next packet
+        try:
+            self.container.seek(int(ts[k]), backward=True, stream=self.stream)
+            for packet in self.container.demux(self.stream):
+                if packet.size == 0 or packet.is_discard:
+                    continue
+                if expected is None: # first packet after the seek: must be in the index, at or before entry k
+                    expected = index_of.get(packet.pos)
+                    if expected is None or expected > k:
+                        return False
+                if expected < len(pos):
+                    if packet.pos != pos[expected]:
+                        return False
+                    expected += 1
+                elif not packet.is_corrupt: # more packets than the index lists
+                    return False
+        except av.FFmpegError:
+            return False
+        finally:
+            self.rewind()
+        return expected == len(pos)
 
     def _auto_index(self):
         ''' Choose the cheapest reliable way to map frame indices to time stamps (see class docstring). '''
         cidx = self._container_index()
         if cidx is None:
             return self.build_index()
-        ts, kf, discard, pos = cidx
+        ts, kf, discard, pos, verified = cidx
         # container index positions can differ from packet positions by a constant (e.g. avi chunk headers)
         self.rewind()
         first_pos = self._first_packet_pos()
@@ -129,8 +168,12 @@ class VideoReader:
         if self.stream.codec_context.has_b_frames == 0:
             # no frame reordering: decode time stamps are presentation time stamps
             keep = ~discard
+            if not verified and not self._index_tail_matches(ts[keep], kf[keep], pos[keep]):
+                return self.build_index()
             self._set_index(ts[keep], ts[keep & kf], ts[keep & kf], source='container', frame_pos=pos[keep])
             return self._calibrate()
+        if not verified: # (the nominal frame rate path below needs the frame count)
+            return self.build_index()
         uniform = np.all(np.abs(np.diff(ts) - float(self._pts_per_frame)) <= float(self.wiggle_pts))
         is_avi = self.container.format.name == 'avi' # avi time stamps are synthesized; always use an index
         if uniform and not discard.any() and self.stream.average_rate == self.stream.guessed_rate and not is_avi:

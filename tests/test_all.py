@@ -232,6 +232,70 @@ def test_video_frame_count_corrected_when_video_ends_early(tmp_path):
         assert reader.nframes == 60
     assert any('ended after 60 frames, expected 65' in str(w.message) for w in caught)
 
+def test_video_fragmented_mp4_uses_container_index(tmp_path):
+    """ Fragmented mp4 has no frame count in its header; its frame table is checked and used instead of a file scan. """
+    import io
+    src, frag, cut = tmp_path / 'src.mp4', tmp_path / 'fragmented.mp4', tmp_path / 'cut.mp4'
+    frames = [np.full((64, 96), (i * 3) % 256, np.uint8) for i in range(300)]
+    with VideoWriter(src, fps=25, g='25', bf='0') as writer:
+        writer.write_frames(frames)
+    with av.open(str(src)) as ic, av.open(str(frag), 'w', options={'movflags': 'delay_moov+default_base_moof', 'frag_duration': '500000'}) as oc:
+        ost = oc.add_stream_from_template(ic.streams.video[0])
+        for packet in ic.demux(video=0):
+            if packet.dts is not None:
+                packet.stream = ost
+                oc.mux(packet)
+    data = frag.read_bytes()
+    last_data = data.rfind(b'mdat') # recording cut off in the middle of the last fragment's frame data
+    cut.write_bytes(data[:last_data + (len(data) - last_data) // 2])
+    with warnings.catch_warnings():
+        warnings.simplefilter('error') # no warnings for a fully recorded file
+        for source in [frag, io.BytesIO(frag.read_bytes())]:
+            with VideoReader(source) as reader:
+                assert reader.stream.frames == 0 and reader.index_source == 'container' and reader.seekable
+                assert reader.nframes == 300
+                _check_random_access(reader, _decode_all(frag))
+    reference = [] # cut-off file (best effort): the frames that can be decoded
+    with av.open(str(cut)) as container:
+        for packet in container.demux(video=0):
+            try:
+                reference += [f.to_ndarray(format='gray') for f in packet.decode()]
+            except av.InvalidDataError:
+                pass
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore')
+        with VideoReader(cut) as reader:
+            assert reader.nframes == len(reference)
+            _check_random_access(reader, reference, n_random=20)
+
+def test_video_fragmented_mp4_open_does_not_decode_the_file(tmp_path, monkeypatch):
+    """ Checking the frame table of a fragmented mp4 reads packets only: opening a file with a single key frame, or with
+    a frame table that is only partly loaded at open (global_sidx), must not decode the whole file. """
+    import daio.video
+    src = tmp_path / 'src.mp4'
+    with VideoWriter(src, fps=25, g='100000', bf='0') as writer: # a single key frame
+        writer.write_frames(_ramp_frames(300))
+    decoded = []
+    original = daio.video.VideoReader._decode
+    def counting_decode(self):
+        for frame in original(self):
+            decoded.append(1)
+            yield frame
+    monkeypatch.setattr(daio.video.VideoReader, '_decode', counting_decode)
+    for movflags, expected_source in [('delay_moov+default_base_moof', 'container'), ('delay_moov+default_base_moof+global_sidx', 'scan')]:
+        frag = tmp_path / f'{movflags.replace("+", "_")}.mp4'
+        with av.open(str(src)) as ic, av.open(str(frag), 'w', options={'movflags': movflags, 'frag_duration': '500000'}) as oc:
+            ost = oc.add_stream_from_template(ic.streams.video[0])
+            for packet in ic.demux(video=0):
+                if packet.dts is not None:
+                    packet.stream = ost
+                    oc.mux(packet)
+        decoded.clear()
+        with VideoReader(frag) as reader:
+            assert reader.index_source == expected_source and reader.nframes == 300, movflags
+            assert len(decoded) < 10, (movflags, len(decoded)) # (a few frames for calibration, not the whole file)
+            assert np.array_equal(reader[299], _decode_all(frag)[299])
+
 def _write_tagged_video(filename, options, settings):
     """ Video with a JSON container tag (e.g. recording settings), a plain container tag and stream tags. """
     import json

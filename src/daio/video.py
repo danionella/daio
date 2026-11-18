@@ -263,7 +263,7 @@ class VideoReader:
         ''' Read one metadata tag. The name is matched exactly, or else ignoring case (mkv stores tag names in upper case).
 
         Args:
-            name (str): tag name, e.g. 'recav_settings'
+            name (str): tag name, e.g. 'settings'
             default: value returned if the tag does not exist. Default is None.
             parse_json (bool): if the value is valid JSON, return the parsed object (e.g. a settings dict). Note that
                 plain numbers are valid JSON too ('512' -> 512). Default is True.
@@ -271,7 +271,7 @@ class VideoReader:
                 container. Default is None (container tags).
 
         Example:
-            >>> settings = reader.read_tag('recav_settings')  # dict, if stored as JSON
+            >>> settings = reader.read_tag('settings')  # dict, if stored as JSON
             >>> reader.read_tag('handler_name', stream=0)
         '''
         tags = self.container.metadata if stream is None else self._stream_by_tag_or_index(stream).metadata

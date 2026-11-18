@@ -54,10 +54,10 @@ Indexing is frame-accurate: `reader[i]` returns the same frame as the i-th frame
 
 Every seek is verified (the frame must come from the expected position in the file, decoded time stamps must increase, and decoding must start at a real key frame). Some files cannot be seeked reliably, e.g. avi files with B-frames, files with duplicate time stamps, or intra-refresh streams. For those, `VideoReader` warns and switches to sequential decoding (`reader.seekable` becomes `False`): frames are still returned correctly, but jumping backwards decodes from the start of the file, which can be slow. Transcoding such files (e.g. `ffmpeg -i input.avi -c:v libx264 -pix_fmt yuv420p output.mp4`) makes them fast to seek again.
 
-Read metadata tags (e.g. recording settings stored by the recording software):
+Read metadata tags (e.g. recording settings stored as JSON):
 ```python
 reader.list_tags()  # {'container': {...}, 'streams': {0: {...}}}
-settings = reader.read_tag('recav_settings')  # JSON values are parsed (here: a dict)
+settings = reader.read_tag('settings')  # JSON values are parsed (e.g. a dict)
 reader.read_tag('handler_name', stream=0)  # a stream's tag (stream index or handler_name)
 ```
 Which tags a file keeps depends on the container: mp4 keeps custom container tags only if written with `movflags=use_metadata_tags`, mkv stores tag names in upper case (`read_tag` ignores case), and avi drops custom tags.

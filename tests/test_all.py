@@ -233,10 +233,10 @@ def test_video_frame_count_corrected_when_video_ends_early(tmp_path):
     assert any('ended after 60 frames, expected 65' in str(w.message) for w in caught)
 
 def _write_tagged_video(filename, options, settings):
-    """ Video with a JSON container tag (as written by recav), a plain container tag and stream tags. """
+    """ Video with a JSON container tag (e.g. recording settings), a plain container tag and stream tags. """
     import json
     with av.open(str(filename), 'w', format='mp4' if str(filename).endswith('.m4v') else None, options=options) as container:
-        container.metadata['recav_settings'] = json.dumps(settings)
+        container.metadata['settings'] = json.dumps(settings)
         container.metadata['comment'] = 'plain text'
         stream = container.add_stream('libx264', rate=25, options={'g': '10'})
         stream.width, stream.height, stream.pix_fmt = 96, 64, 'yuv420p'
@@ -269,8 +269,8 @@ def test_video_tags(tmp_path):
                 reader = VideoReader(source)
             tags = reader.list_tags()
             assert set(tags) == {'container', 'streams'} and list(tags['streams']) == [0], name
-            assert reader.read_tag('recav_settings') == settings, name # JSON is parsed
-            assert reader.read_tag('recav_settings', parse_json=False).startswith('{"camera"'), name
+            assert reader.read_tag('settings') == settings, name # JSON is parsed
+            assert reader.read_tag('settings', parse_json=False).startswith('{"camera"'), name
             assert reader.read_tag('comment') == 'plain text', name # not JSON: returned as string
             assert reader.read_tag('missing') is None and reader.read_tag('missing', default=42) == 42, name
             assert reader.read_tag('handler_name', stream=0) == 'cam0', name

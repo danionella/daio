@@ -9,7 +9,48 @@ from fractions import Fraction
 
 SCAN_NOTICE_BYTES = 1e9  # print a notice when scanning files larger than this to build a frame index
 
-class VideoReader:
+class _TagReader:
+    ''' Metadata tag access for readers with an open PyAV container (self.container). '''
+
+    def list_tags(self):
+        ''' Metadata tags of the file, as exposed by the container format.
+
+        Returns:
+            dict: {'container': {name: value}, 'streams': {stream index: {name: value}}}. Values are strings. Which
+            tags are available depends on the container: e.g. mp4 files keep custom container tags only if written
+            with movflags=use_metadata_tags, mkv returns custom tag names in upper case, and avi drops them.
+        '''
+        return {'container': dict(self.container.metadata),
+                'streams': {s.index: dict(s.metadata) for s in self.container.streams}}
+
+    def read_tag(self, name, default=None, parse_json=True, stream=None):
+        ''' Read one metadata tag. The name is matched exactly, or else ignoring case (mkv stores tag names in upper case).
+
+        Args:
+            name (str): tag name, e.g. 'settings'
+            default: value returned if the tag does not exist. Default is None.
+            parse_json (bool): if the value is valid JSON, return the parsed object (e.g. a settings dict). Note that
+                plain numbers are valid JSON too ('512' -> 512). Default is True.
+            stream (int or str): read a tag of a stream (by index, or by its handler_name tag) instead of the
+                container. Default is None (container tags).
+
+        Example:
+            >>> settings = reader.read_tag('settings')  # dict, if stored as JSON
+            >>> reader.read_tag('handler_name', stream=0)
+        '''
+        tags = self.container.metadata if stream is None else _find_stream(self.container, stream).metadata
+        value = _get_tag(tags, name)
+        if value is None:
+            return default
+        if parse_json:
+            try:
+                return json.loads(value)
+            except ValueError:
+                pass
+        return value
+
+
+class VideoReader(_TagReader):
     ''' A class to read video files quickly, using PyAV. It allows for fast seeking and reading of frames.
 
     Frame index `i` always refers to the i-th frame in presentation order, i.e. `reader[i]` returns the same frame as
@@ -31,6 +72,8 @@ class VideoReader:
         index (str): how to map frame indices to time stamps. 'auto' (default): choose as described above (a file
             scan is also done lazily if a seek lands on an unexpected time stamp). 'scan': always scan the file.
             'nominal': always use the nominal frame rate (legacy behaviour; not reliable for variable frame rates).
+        stream (int or str): video stream to read: its stream index (as in list_tags()), or its handler_name tag.
+            Default is None (the first video stream).
 
     Seeks are verified: the frame found by a seek must be a key frame where decoding starts, decoded time stamps must
     increase, and (with a frame index) the frame must come from the expected position in the file. If a check fails
@@ -38,10 +81,11 @@ class VideoReader:
     switches to sequential decoding (`seekable` becomes False): frames are still returned correctly, but jumping
     backwards decodes from the start of the file, which can be slow.
     '''
-    def __init__(self, filename, format='gray', threading=True, thread_count=0, tolerance=0.1, index='auto'):
+    def __init__(self, filename, format='gray', threading=True, thread_count=0, tolerance=0.1, index='auto', stream=None):
         if index not in ('auto', 'scan', 'nominal'):
             raise ValueError(f"index must be 'auto', 'scan' or 'nominal', not {index!r}")
         self.filename = filename
+        self._stream_spec = stream
         self._threading, self._thread_count = threading, thread_count
         self._open()
         self._rewind_reopens = not self._seek_reaches_start()
@@ -76,7 +120,7 @@ class VideoReader:
         if hasattr(self.filename, 'seek'): # file-like object: (re)open from its start
             self.filename.seek(0)
         self.container = av.open(self.filename)
-        self.stream = self.container.streams.video[0]
+        self.stream = _find_stream(self.container, self._stream_spec, 'video')
         self.stream.codec_context.thread_count = self._thread_count
         self.stream.codec_context.thread_type = 'AUTO' if self._threading else 'SLICE' # FRAME/AUTO/SLICE
         self.stream.codec_context.flags |= av.codec.context.Flags.copy_opaque # decoded frames carry their packet's file position
@@ -290,51 +334,6 @@ class VideoReader:
     def frame_times(self):
         ''' Presentation times of all frames (in seconds). '''
         return self.frame_pts * float(self.stream.time_base)
-
-    def list_tags(self):
-        ''' Metadata tags of the file, as exposed by the container format.
-
-        Returns:
-            dict: {'container': {name: value}, 'streams': {stream index: {name: value}}}. Values are strings. Which
-            tags are available depends on the container: e.g. mp4 files keep custom container tags only if written
-            with movflags=use_metadata_tags, mkv returns custom tag names in upper case, and avi drops them.
-        '''
-        return {'container': dict(self.container.metadata),
-                'streams': {s.index: dict(s.metadata) for s in self.container.streams}}
-
-    def read_tag(self, name, default=None, parse_json=True, stream=None):
-        ''' Read one metadata tag. The name is matched exactly, or else ignoring case (mkv stores tag names in upper case).
-
-        Args:
-            name (str): tag name, e.g. 'settings'
-            default: value returned if the tag does not exist. Default is None.
-            parse_json (bool): if the value is valid JSON, return the parsed object (e.g. a settings dict). Note that
-                plain numbers are valid JSON too ('512' -> 512). Default is True.
-            stream (int or str): read a tag of a stream (by index, or by its handler_name tag) instead of the
-                container. Default is None (container tags).
-
-        Example:
-            >>> settings = reader.read_tag('settings')  # dict, if stored as JSON
-            >>> reader.read_tag('handler_name', stream=0)
-        '''
-        tags = self.container.metadata if stream is None else self._stream_by_tag_or_index(stream).metadata
-        value = _get_tag(tags, name)
-        if value is None:
-            return default
-        if parse_json:
-            try:
-                return json.loads(value)
-            except ValueError:
-                pass
-        return value
-
-    def _stream_by_tag_or_index(self, stream):
-        if isinstance(stream, (int, np.integer)):
-            return self.container.streams[int(stream)]
-        for s in self.container.streams:
-            if _get_tag(s.metadata, 'handler_name') == stream:
-                return s
-        raise KeyError(f'no stream with handler_name {stream!r}')
 
     def read(self):
         ''' Read the next frame in the specified format. '''
@@ -606,7 +605,7 @@ class VideoReader:
     @property
     def frame_shape(self):
         ''' Return the shape of the video frames. '''
-        return self.container.streams.video[0].codec_context.height, self.container.streams.video[0].codec_context.width
+        return self.stream.codec_context.height, self.stream.codec_context.width
 
     @property
     def nframes(self):
@@ -639,15 +638,356 @@ class VideoReader:
         return np.prod(self.shape)
     
     @staticmethod
-    def static_shape(filename):
+    def static_shape(filename, stream=None):
         ''' Get the shape of a video (static method). 
         
         Args:
-            filename (str): path to the video file'''
+            filename (str): path to the video file
+            stream (int or str): video stream (stream index or handler_name). Default is None (the first video stream).'''
         with av.open(filename) as container:
-            stream = container.streams.video[0]
+            stream = _find_stream(container, stream, 'video')
             shape = np.array([stream.frames, stream.codec_context.height, stream.codec_context.width])
         return shape
+
+
+class AudioReader(_TagReader):
+    ''' A class to read audio from any file FFmpeg can open (e.g. mp4/m4a, mkv, wav, flac, mp3), using PyAV.
+
+    Samples are returned as float32 arrays of shape (channels, samples), scaled to [-1, 1]. Sample index i is the i-th
+    sample of a sequential decode from the start of the stream (no samples skipped or added), and `reader[a:b]`
+    returns the same samples as reading sequentially. Fast random access uses the time stamps of the file; before the
+    first random access, they are checked for gaps (using the container index if complete, else by reading the
+    packets of the file once, without decoding). Files with gaps or unusable time stamps are read by counting decoded
+    samples instead, with a warning: still correct, but jumping backwards decodes from the start of the file.
+
+    Random access starts decoding a little before the requested position and discards that run-in: uncompressed and
+    lossless audio (e.g. wav, flac) and mp3 are bit-exact; aac and opus decoders synthesize noise, so samples after a
+    seek can differ from a sequential decode by tiny amounts (up to about 1e-3 for aac, 1e-4 for opus).
+
+    Args:
+        filename (str or file-like): path to the file
+        stream (int or str): audio stream to read: its stream index (as in list_tags()), or its handler_name tag.
+            Default is None (the first audio stream).
+
+    Example:
+        >>> with AudioReader('/path/to/video.mp4') as audio:
+        ...     everything = audio.read()              # shape (channels, samples)
+        ...     snippet = audio[48000:96000]           # by sample index
+        ...     during = audio.read_time(1.0, 1.04)    # by time (same clock as VideoReader.frame_times)
+    '''
+    RUN_IN = 0.25  # seconds decoded (and discarded) before a random access position
+
+    def __init__(self, filename, stream=None):
+        self.filename = filename
+        self._stream_spec = stream
+        self._open()
+        self.sample_rate = self.stream.codec_context.sample_rate
+        self.channels = self.stream.codec_context.layout.nb_channels
+        self.seekable = True  # False: time stamps are missing or irregular, samples are decoded from the start
+        self._ticks = float(self.stream.time_base * self.sample_rate)  # samples per time stamp tick
+        self._offset = 0  # sample position = round(pts * ticks) + offset
+        self._grid = None  # coarse time stamps (e.g. 1 ms in mkv): (position, frame size, pts * ticks) of a reference frame
+        self._start_time = 0.0
+        self._nsamples = None
+        self._cursor = None  # (sample position, frame generator, pending (position, samples)) after the last read
+        self._checked = False  # whether the time stamps were checked for gaps (before the first random access)
+        self._calibrate()
+
+    def _open(self):
+        if hasattr(self, 'container'):
+            self.container.close()
+        if hasattr(self.filename, 'seek'): # file-like object: (re)open from its start
+            self.filename.seek(0)
+        self.container = av.open(self.filename)
+        self.stream = _find_stream(self.container, self._stream_spec, 'audio')
+
+    def _rewind(self):
+        self._open() # (seeking to 0 can skip the first frame, e.g. opus in mkv)
+
+    def _frames(self, from_start=False):
+        ''' Decode from the current position: yields (sample position from the time stamp, or None; samples). When
+        decoding from the start, the first frame is at position 0 (its time stamp can precede a shortened first frame). '''
+        for frame in self.container.decode(self.stream):
+            if from_start:
+                pos, from_start = 0, False
+            else:
+                pos = None if frame.pts is None else self._pos(frame.pts)
+            yield pos, _audio_frame_to_float(frame)
+
+    def _pos(self, pts):
+        ''' Sample position of a frame from its time stamp. Coarse time stamps are snapped to the frame grid. '''
+        raw = pts * self._ticks
+        if self._grid is None:
+            return round(raw) + self._offset
+        ref_pos, size, ref_raw = self._grid
+        return ref_pos + round((raw - ref_raw) / size) * size
+
+    def _calibrate(self, n_frames=8):
+        ''' Align time stamp positions with sample counts of a sequential decode: the first frame can be shortened
+        (e.g. encoder priming, opus pre-skip) without its time stamp being adjusted. Frames after the first one must be
+        contiguous. Time stamps coarser than one sample (e.g. 1 ms in mkv) are snapped to the grid of frame starts,
+        which needs a constant frame size. '''
+        self._rewind()
+        frames = [(frame.pts, frame.samples) for _, frame in zip(range(n_frames), self.container.decode(self.stream))]
+        self._rewind()
+        if not frames:
+            self._nsamples = 0
+            return
+        if any(pts is None for pts, _ in frames):
+            return self._set_unseekable('missing time stamps')
+        ref = min(1, len(frames) - 1) # the first frame may be shortened: calibrate on the second one
+        counted = [sum(n for _, n in frames[:i]) for i in range(len(frames))]
+        raw = [pts * self._ticks for pts, _ in frames]
+        self._start_time = float(frames[ref][0] * self.stream.time_base) - counted[ref] / self.sample_rate
+        if self._ticks <= 1: # time stamps resolve single samples
+            self._offset = counted[ref] - round(raw[ref])
+        else:
+            size = frames[ref][1]
+            if any(n != size for _, n in frames[ref:-1]):
+                return self._set_unseekable('coarse time stamps and varying frame sizes')
+            self._grid = (counted[ref], size, raw[ref])
+        if any(self._pos(frames[i][0]) != counted[i] for i in range(ref, len(frames))):
+            return self._set_unseekable('irregular time stamps')
+
+    def _check_time_stamps(self):
+        ''' Check (once, before the first random access) that the time stamps have no gaps, so that positions from
+        time stamps equal sample counts. For codecs with a fixed frame size and a complete container index (e.g. aac in
+        mp4), the index is checked (no file read). Otherwise, the audio is decoded once (about 1000x real time) and each
+        frame's position is compared with the number of samples before it. (Packet time stamps alone are not enough:
+        mp4 stores a gap as a longer duration of the preceding frame.) '''
+        if self._checked or not self.seekable:
+            return self.seekable
+        self._checked = True
+        tolerance = 1.5 * max(self._ticks, 1) # (coarse time stamps are rounded)
+        entries = self.stream.index_entries
+        size = self.stream.codec_context.frame_size
+        if size and self.stream.frames and len(entries) == self.stream.frames: # (e.g. mp4: complete sample table)
+            starts = np.array([e.timestamp for e in entries], dtype=np.float64) * self._ticks
+            ok = bool(np.all(np.abs(np.diff(starts)[:-1] - size) <= tolerance))
+        else:
+            ok, counted = True, 0
+            self._rewind()
+            for i, frame in enumerate(self.container.decode(self.stream)):
+                if i > 0 and (frame.pts is None or self._pos(frame.pts) != counted):
+                    ok = False
+                    break
+                counted += frame.samples
+            self._rewind()
+            self._cursor = None
+            if ok:
+                self._nsamples = counted
+        if not ok:
+            self._set_unseekable('gaps in the time stamps')
+        return ok
+
+    def _set_unseekable(self, reason):
+        if self.seekable:
+            self.seekable = False
+            warnings.warn(f'{self.filename}: fast random access is not possible for this audio stream ({reason}). '
+                          'Samples are counted while decoding instead: correct, but jumping backwards decodes from the '
+                          'start of the file, which can be slow.', stacklevel=3)
+
+    @property
+    def nsamples(self):
+        ''' Number of samples per channel (exact; the end of the stream is decoded once to determine it). '''
+        if self._nsamples is None:
+            self._nsamples = self._count_samples()
+        return self._nsamples
+
+    def _count_samples(self):
+        if self.stream.duration and self._check_time_stamps():
+            end = (self.stream.start_time or 0) + self.stream.duration
+            run_in = int(self.RUN_IN / self.stream.time_base)
+            try:
+                self.container.seek(int(end - run_in), backward=True, stream=self.stream)
+                last = None
+                for pos, data in self._frames():
+                    if pos is None:
+                        last = None
+                        break
+                    last = pos + data.shape[1]
+                if last is not None:
+                    return last
+            except av.FFmpegError:
+                pass
+            finally:
+                self._cursor = None
+                self._rewind()
+        self._rewind() # count by decoding everything
+        total = sum(data.shape[1] for _, data in self._frames())
+        self._rewind()
+        return total
+
+    @property
+    def duration(self):
+        ''' Duration in seconds. '''
+        return self.nsamples / self.sample_rate
+
+    @property
+    def start_time(self):
+        ''' Presentation time of sample 0 in seconds (same clock as VideoReader.frame_times). '''
+        return self._start_time
+
+    def read(self, start=0, stop=None):
+        ''' Read samples [start, stop) (all samples by default). Returns a float32 array of shape (channels, samples). '''
+        n = self.nsamples
+        start, stop, _ = slice(start, stop).indices(n)
+        out = np.zeros((self.channels, max(stop - start, 0)), dtype=np.float32)
+        if stop <= start:
+            return out
+        if self._cursor is not None and self._cursor[0] == start: # continue where the last read ended
+            frames, pending = self._cursor[1], self._cursor[2]
+        elif self._check_time_stamps():
+            frames, pending = self._seek(start), None
+            if frames is None: # time stamps turned out to be irregular
+                return self.read(start, stop)
+        else:
+            self._rewind()
+            frames, pending = self._counted(self._frames()), None
+        filled, expected = 0, None
+        source = _chain_pending(pending, frames)
+        for pos, data in source:
+            if expected is not None and pos != expected:
+                self._set_unseekable('irregular time stamps')
+                self._cursor = None
+                return self.read(start, stop)
+            expected = pos + data.shape[1]
+            a, b = max(start, pos), min(stop, expected)
+            if b > a:
+                out[:, a - start:b - start] = data[:, a - pos:b - pos]
+                filled = b - start
+            if expected >= stop:
+                self._cursor = (stop, frames, (pos, data) if expected > stop else None)
+                return out
+            filled = max(filled, min(stop, expected) - start)
+        self._cursor = None
+        return out[:, :filled]
+
+    def _counted(self, frames):
+        ''' Positions by counting samples (for streams with unreliable time stamps; decoding from the start). '''
+        pos = 0
+        for _, data in frames:
+            yield pos, data
+            pos += data.shape[1]
+
+    def _seek(self, start):
+        ''' Position the decoder so that decoding continues with a frame containing sample start (after a run-in).
+        Returns the frame generator, starting with that frame, or None if time stamps turned out to be irregular.
+        After a seek, the first decoded frames can be shortened without adjusted time stamps (e.g. opus pre-roll), so
+        positions are trusted from the first frame that follows its predecessor without a gap. '''
+        self._cursor = None
+        run_in = int(self.RUN_IN * self.sample_rate)
+        for target in [start - run_in, start - 4 * run_in, None]:
+            from_start = target is None or target <= 0
+            if from_start:
+                self._rewind()
+            else:
+                ts = int((self._start_time + target / self.sample_rate) / self.stream.time_base)
+                try:
+                    self.container.seek(ts, backward=True, stream=self.stream)
+                except av.FFmpegError:
+                    continue
+            frames = self._frames(from_start=from_start)
+            synced = from_start # (from the start, the first frame is at position 0)
+            prev = current = None
+            for item in frames:
+                if item[0] is None:
+                    break
+                if not synced:
+                    synced = prev is not None and prev[0] + prev[1].shape[1] == item[0]
+                    prev = item
+                    if not synced:
+                        continue
+                if current is None:
+                    if item[0] > start: # landed after the requested sample: seek further back
+                        break
+                elif item[0] != current[0] + current[1].shape[1]:
+                    self._set_unseekable('irregular time stamps')
+                    return None
+                current = item
+                if current[0] + current[1].shape[1] > start:
+                    return _chain_pending(current, frames)
+            else:
+                if current is not None: # end of the stream before start
+                    return iter(())
+        return None
+
+    def read_time(self, start_time, stop_time):
+        ''' Read the samples from start_time to stop_time (in seconds, on the same clock as VideoReader.frame_times).
+        Sample i is taken to be at start_time + i / sample_rate, which holds for audio without gaps. '''
+        to_sample = lambda t: round((t - self.start_time) * self.sample_rate)
+        return self.read(max(to_sample(start_time), 0), max(to_sample(stop_time), 0))
+
+    def __getitem__(self, index):
+        if isinstance(index, (int, np.integer)):
+            i = int(index) + (self.nsamples if index < 0 else 0)
+            if not 0 <= i < self.nsamples:
+                raise IndexError(f'sample index {index} out of range for {self.nsamples} samples')
+            return self.read(i, i + 1)[:, 0]
+        if isinstance(index, slice):
+            start, stop, step = index.indices(self.nsamples)
+            if step == 1:
+                return self.read(start, stop)
+            lo, hi = (start, stop) if step > 0 else (stop + 1, start + 1)
+            return self.read(lo, hi)[:, start - lo::step] if hi > lo else np.zeros((self.channels, 0), np.float32)
+        raise IndexError(f'audio samples can be indexed with integers or slices, not {index!r}')
+
+    def __len__(self):
+        return self.nsamples
+
+    def close(self):
+        if hasattr(self, 'container'):
+            self.container.close()
+
+    def __del__(self):
+        self.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.close()
+        return False
+
+
+def _chain_pending(pending, frames):
+    ''' Yield pending (if not None), then the items of frames. (No "yield from": closing this generator would close
+    frames too, which is kept to continue reading.) '''
+    if pending is not None:
+        yield pending
+    for item in frames:
+        yield item
+
+
+def _audio_frame_to_float(frame):
+    ''' Samples of an audio frame as float32, shape (channels, samples), scaled to [-1, 1]. '''
+    data = frame.to_ndarray()
+    if not frame.format.is_planar: # interleaved: shape (1, samples * channels)
+        data = data.reshape(-1, frame.layout.nb_channels).T
+    if data.dtype == np.uint8:
+        return (data.astype(np.float32) - 128) / 128
+    if data.dtype.kind == 'i':
+        return data.astype(np.float32) / float(2 ** (8 * data.dtype.itemsize - 1))
+    return data.astype(np.float32)
+
+
+def _find_stream(container, stream=None, kind=None):
+    ''' A stream of the container: the first stream of the given kind ('video', 'audio'; stream=None), the stream with
+    this index (int, as in list_tags()), or the stream whose handler_name tag is this string. '''
+    candidates = [s for s in container.streams if kind is None or s.type == kind]
+    if stream is None:
+        if not candidates:
+            raise ValueError(f'the file has no {kind} stream')
+        return candidates[0]
+    if isinstance(stream, (int, np.integer)) and not isinstance(stream, bool):
+        found = container.streams[int(stream)]
+        if kind is not None and found.type != kind:
+            raise ValueError(f'stream {int(stream)} is a {found.type} stream, not a {kind} stream')
+        return found
+    for s in candidates:
+        if _get_tag(s.metadata, 'handler_name') == stream:
+            return s
+    raise KeyError(f"no {kind + ' ' if kind else ''}stream with handler_name {stream!r}")
 
 
 def _get_tag(tags, name):

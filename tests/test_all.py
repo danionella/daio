@@ -509,6 +509,51 @@ def test_audio_reader_checks_time_stamps_without_decoding(tmp_path, monkeypatch)
                 assert np.allclose(audio[1000:2000], everything[:, 1000:2000], rtol=0, atol=atol), (codec, ext)
                 assert audio.seekable, (codec, ext)
 
+def test_audio_reader_opens_file_once(tmp_path, monkeypatch):
+    """ Opening a file can be slow (e.g. long fragmented mp4 on a network share): AudioReader opens it once, and for
+    decoders without random state goes back to the start by seeking, checking that the first frames are those of the
+    file (else it reopens it: e.g. seeking to the start of opus in mkv skips its first frame). """
+    import daio.video
+    opened = []
+    original_open = daio.video.av.open
+    def counting_open(*args, **kwargs):
+        opened.append(1)
+        return original_open(*args, **kwargs)
+    monkeypatch.setattr(daio.video.av, 'open', counting_open)
+    rate = 48000
+    signal = _sine(rate, 3, channels=1)
+    fragmented = {'movflags': 'frag_keyframe+empty_moov'}
+    full = tmp_path / 'full.mp3'
+    _write_audio(full, 'libmp3lame', signal, rate)
+    cut = tmp_path / 'cut.mp3' # (packets copied from the middle: the first frames need the bit reservoir before them)
+    with original_open(str(full)) as ic, original_open(str(cut), 'w') as oc:
+        ost = oc.add_stream_from_template(ic.streams.audio[0])
+        for k, packet in enumerate(ic.demux(audio=0)):
+            if k >= 40 and packet.size:
+                packet.stream = ost
+                oc.mux(packet)
+    cases = [('flac', 'flac.mp4', fragmented, True), ('alac', 'alac.m4a', None, True), ('flac', 'flac.mkv', None, True),
+             ('libmp3lame', 'mp3.mp4', None, True), (None, 'cut.mp3', None, None), ('aac', 'aac.mp4', None, False),
+             ('libopus', 'opus.mkv', None, False)]
+    for codec, name, options, once in cases:
+        filename = tmp_path / name
+        if codec:
+            _write_audio(filename, codec, signal, rate, container_options=options)
+        if codec == 'libopus': # (check that a mismatch of the first frames after seeking is found)
+            monkeypatch.setattr(daio.video, '_deterministic_decoder', lambda name: True)
+        reference = _decode_audio(filename)
+        opened.clear()
+        with AudioReader(filename) as audio:
+            assert len(opened) == 1, name
+            n = audio.nsamples
+            for start in [n // 2, 0, 5000, n - 3000, 0, 100]: # (reads from the start go back to it)
+                expected = reference[:, start:start + 3000]
+                atol = 2e-3 if codec in ('aac', 'libopus') else 0 # (noise synthesis after seeking)
+                assert np.allclose(audio[start:start + 3000], expected, rtol=0, atol=atol), (name, start)
+            assert np.array_equal(audio.read(0, 20000), reference[:, :20000]), name # (from the start: exact)
+            if once is not None:
+                assert (len(opened) == 1) == once, (name, len(opened)) # (else: reopened to read from the start exactly)
+
 def test_audio_video_time_mapping(tmp_path):
     """ Audio samples and video frames map to each other through time (seconds on the same clock), for scalars and
     arrays, with selectable rounding; also for audio with a gap in the time stamps. """

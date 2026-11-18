@@ -761,6 +761,8 @@ class AudioReader(_TagReader):
         self._cursor = None  # (sample position, frame generator, pending (position, samples)) after the last read
         self._checked = False  # whether the time stamps were checked for gaps (before the first random access)
         self._table = None  # (first sample, time, samples) of each decoded frame, for streams with gaps (see _frame_table)
+        self._start = None  # (time stamp to seek to, signature of the first decoded frame) for rewinding (see _rewind)
+        self._verify_start = False  # whether the next decoded frame must match the first frame (after a rewind)
         self._calibrate()
 
     def _open(self):
@@ -772,11 +774,49 @@ class AudioReader(_TagReader):
         self.stream = _find_stream(self.container, self._stream_spec, 'audio')
 
     def _rewind(self):
-        self._open() # (seeking to 0 can skip the first frame, e.g. opus in mkv)
+        ''' Go back to the start of the stream: by seeking (cheap), else by reopening the file (which reads the header
+        and index again: slow e.g. for long fragmented mp4 on network shares). Seeking is used only for decoders without
+        random state (not e.g. aac, opus or ac3, which synthesize noise or dither: their samples after a seek can differ
+        from those of a sequential decode). Seeking to the start can also skip the first frame (e.g. opus in mkv), and
+        decoders can carry state from earlier frames (e.g. the mp3 bit reservoir), so the first frames decoded after it
+        (about 0.2 s, as decoded on opening) are compared with those of the file, and the file is reopened if they
+        differ (see _decode). '''
+        self._release()
+        if self._start is None:
+            return self._open()
+        try:
+            self.container.seek(self._start[0], backward=True, stream=self.stream)
+        except av.FFmpegError:
+            return self._open()
+        self._verify_start = True
+
+    def _release(self):
+        ''' After decoding or reading packets for other purposes: the position in the file is no longer that of a read
+        (decoding from the start must rewind first, random access seeks). '''
+        self._cursor = None
+        self._verify_start = False
+
+    def _seek_to(self, timestamp):
+        ''' Seek (backward) to a time stamp of the stream, for random access. '''
+        self._release()
+        self.container.seek(timestamp, backward=True, stream=self.stream)
 
     def _decode(self):
         ''' Decode from the current position. Undecodable damaged packets (e.g. the last one of a cut-off recording)
-        are skipped, with a warning, in every way of reading (so that sample counts agree). '''
+        are skipped, with a warning, in every way of reading (so that sample counts agree). After a rewind, the first
+        frames must be those of the file (see _rewind), else the file is reopened and decoding continues there. '''
+        expected = self._start[1] if self._verify_start else [] # (signatures of the first frames of the file)
+        self._verify_start = False
+        for i, frame in enumerate(self._decode_packets()):
+            if i < len(expected) and _frame_signature(frame) != expected[i]:
+                self._open() # (frames before i were identical: continue with frame i of the reopened file)
+                for j, frame in enumerate(self._decode_packets()):
+                    if j >= i:
+                        yield frame
+                return
+            yield frame
+
+    def _decode_packets(self):
         for packet in self.container.demux(self.stream):
             try:
                 frames = packet.decode()
@@ -827,10 +867,26 @@ class AudioReader(_TagReader):
         ''' Align time stamp positions with sample counts of a sequential decode: the first frame can be shortened
         (e.g. encoder priming, opus pre-skip) without its time stamp being adjusted. Frames after the first one must be
         contiguous. Time stamps coarser than one sample (e.g. 1 ms in mkv) are snapped to the grid of frame starts,
-        which needs a constant frame size. '''
-        self._rewind()
-        frames = [(frame.pts, frame.samples) for _, frame in zip(range(n_frames), self._decode())]
-        self._rewind()
+        which needs a constant frame size. Also records the first frame, for rewinding by seeking (see _rewind). '''
+        frames, signatures, first_ts = [], [], None # (decoding from the freshly opened file)
+        for packet in self.container.demux(self.stream):
+            if first_ts is None and packet.size:
+                first_ts = packet.dts if packet.dts is not None else packet.pts
+            try:
+                decoded = packet.decode()
+            except av.InvalidDataError:
+                if not packet.is_corrupt:
+                    raise
+                continue
+            for frame in decoded:
+                frames.append((frame.pts, frame.samples))
+                signatures.append(_frame_signature(frame))
+            if len(frames) >= n_frames:
+                break
+        frames, signatures = frames[:n_frames], signatures[:n_frames]
+        if first_ts is not None and signatures and _deterministic_decoder(self.stream.codec_context.name):
+            self._start = (first_ts, signatures)
+        self._release()
         if not frames:
             self._nsamples = 0
             return
@@ -893,8 +949,7 @@ class AudioReader(_TagReader):
                     ok = False
                     break
                 counted += frame.samples
-            self._rewind()
-            self._cursor = None
+            self._release()
             if ok:
                 self._nsamples = counted
         if not ok:
@@ -926,7 +981,7 @@ class AudioReader(_TagReader):
         index_of = {pos: i for i, (_, pos) in enumerate(rows)}
         expected = None # index entry of the next packet
         try:
-            self.container.seek(int(rows[k][0]), backward=True, stream=self.stream)
+            self._seek_to(int(rows[k][0]))
             for packet in self.container.demux(self.stream):
                 if not packet.size:
                     continue
@@ -943,8 +998,7 @@ class AudioReader(_TagReader):
         except av.FFmpegError:
             return False
         finally:
-            self._rewind()
-            self._cursor = None
+            self._release()
         return expected == len(rows)
 
     def _check_packet_time_stamps(self, size, tolerance):
@@ -960,8 +1014,7 @@ class AudioReader(_TagReader):
                     pts.append(packet.pts)
             return _on_grid(pts, self._ticks, size, tolerance)
         finally:
-            self._rewind()
-            self._cursor = None
+            self._release()
 
     def _set_unseekable(self, reason):
         if self.seekable:
@@ -985,7 +1038,7 @@ class AudioReader(_TagReader):
             end = (self.stream.start_time or 0) + self.stream.duration
             run_in = int(self.RUN_IN / self.stream.time_base)
             try:
-                self.container.seek(int(end - run_in), backward=True, stream=self.stream)
+                self._seek_to(int(end - run_in))
                 last = None
                 for pos, data in self._frames():
                     if pos is None:
@@ -997,11 +1050,10 @@ class AudioReader(_TagReader):
             except av.FFmpegError:
                 pass
             finally:
-                self._cursor = None
-                self._rewind()
+                self._release()
         self._rewind() # count by decoding everything
         total = sum(data.shape[1] for _, data in self._frames())
-        self._rewind()
+        self._release()
         return total
 
     @property
@@ -1074,7 +1126,7 @@ class AudioReader(_TagReader):
             else:
                 ts = int((self._start_time + target / self.sample_rate) / self.stream.time_base)
                 try:
-                    self.container.seek(ts, backward=True, stream=self.stream)
+                    self._seek_to(ts)
                 except av.FFmpegError:
                     continue
             frames = self._frames(from_start=from_start)
@@ -1179,8 +1231,7 @@ class AudioReader(_TagReader):
                 starts.append(pos); times.append(t); sizes.append(frame.samples)
                 pos += frame.samples
                 next_time = t + frame.samples / rate
-            self._rewind()
-            self._cursor = None
+            self._release()
             self._nsamples = pos
             self._table = (np.array(starts, dtype=np.int64), np.array(times, dtype=np.float64),
                            np.array(sizes, dtype=np.int64))
@@ -1250,6 +1301,17 @@ def _fixed_frame_size(codec_context):
             min_size, max_size = int.from_bytes(extradata[0:2], 'big'), int.from_bytes(extradata[2:4], 'big')
             return min_size if min_size == max_size else None
     return None
+
+
+def _deterministic_decoder(codec_name):
+    ''' Whether an audio decoder gives the same samples however it is reached (no synthesized noise or dither). '''
+    return codec_name.startswith(('pcm_', 'adpcm_')) or codec_name in (
+        'flac', 'alac', 'mp3', 'mp3float', 'mp2', 'mp2float', 'wavpack', 'tta', 'ape')
+
+
+def _frame_signature(frame):
+    ''' Identifies a decoded audio frame (time stamp, number of samples, content). '''
+    return frame.pts, frame.samples, hash(frame.to_ndarray().tobytes())
 
 
 def _chain_pending(pending, frames):

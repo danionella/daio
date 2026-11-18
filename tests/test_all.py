@@ -442,7 +442,8 @@ def test_audio_reader_gap_in_time_stamps(tmp_path):
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter('always')
             with AudioReader(filename) as audio:
-                assert audio.nsamples == len(audio) == reference.shape[1] == signal.shape[1], name # none lost or added
+                assert audio.nsamples == len(audio) == reference.shape[1], name # no samples lost or added
+                assert codec != 'flac' or audio.nsamples == signal.shape[1], name # (mp3 can keep encoder padding)
                 for start in [100, 10 * frame_size - 300, 10 * frame_size + 5000, 70000, 20000, audio.nsamples - 3000]:
                     assert np.array_equal(audio[start:start + 3000], reference[:, start:start + 3000]), (name, start)
                 assert np.array_equal(audio[-1], reference[:, -1]), name

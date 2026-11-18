@@ -433,8 +433,12 @@ def test_audio_reader_gap_in_time_stamps(tmp_path):
         ('overlap.mkv', 'flac', (10, -3000), 'overlaps in the time stamps'),
         ('gap_before_last_frame.mp4', 'libmp3lame', (96000 // 1152, 5000), 'overlaps in the time stamps'),
         ('gap_after_first_frame.mkv', 'flac', (1, 4800), 'gap or overlap after the first frame'),
+        ('gap.m4a', 'alac', (10, 12000), 'overlaps in the time stamps'),
+        ('overlap.m4a', 'alac', (10, -3000), 'overlaps in the time stamps'),
         ('flac.ogg', 'flac', None, 'unreliable after seeking'),
-        ('no_gap.mkv', 'flac', None, None)]
+        ('no_gap.mkv', 'flac', None, None),
+        ('no_gap.mp4', 'flac', None, None),
+        ('no_gap.m4a', 'alac', None, None)]
     for name, codec, gap, warning in cases:
         filename = tmp_path / name
         frame_size = _write_audio(filename, codec, signal, rate, gap=gap)
@@ -453,6 +457,22 @@ def test_audio_reader_gap_in_time_stamps(tmp_path):
                 assert audio.seekable == (warning is None), name
         messages = [str(w.message) for w in caught]
         assert (any(warning in m for m in messages) if warning else not messages), (name, messages)
+
+def test_audio_reader_checks_mp4_index_without_decoding(tmp_path):
+    """ In mp4, codecs with a guaranteed frame size (aac, alac, flac with a fixed block size) are checked for gaps using
+    the sample table only, without decoding the file; gaps are found there too. """
+    rate = 48000
+    signal = _sine(rate, 2, channels=1)
+    for codec in ['aac', 'alac', 'flac']:
+        for gap in [None, (10, 3000)]:
+            filename = tmp_path / f'{codec}_{gap is not None}.mp4'
+            _write_audio(filename, codec, signal, rate, gap=gap)
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter('always')
+                with AudioReader(filename) as audio:
+                    assert audio._check_time_stamps() == (gap is None), codec
+                    assert audio._nsamples is None, codec # (not decoded: the whole stream would have been counted)
+            assert any('overlaps in the time stamps' in str(w.message) for w in caught) == (gap is not None), codec
 
 def test_reader_stream_selection(tmp_path):
     """ VideoReader and AudioReader read a selected stream: by stream index, or by handler_name. """

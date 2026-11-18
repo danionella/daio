@@ -15,7 +15,6 @@ Links: [API documentation](http://danionella.github.io/daio), [GitHub repository
 #### Video IO
 - **Efficient Video Reading**: Use `VideoReader` for fast frame-accurate video reading with support for array-like indexing and iteration.
 - **Video Writing**: Write video files easily with `VideoWriter`, supporting multiple codecs and pixel formats.
-- **Audio Reading**: Read audio tracks with `AudioReader`, by sample index or by time (on the same clock as `VideoReader`).
 
 #### HDF5 File IO
 - **Lazy Loading**: Access HDF5 files with a dictionary-like interface using `lazyh5`, loading data only when accessed.
@@ -95,7 +94,7 @@ with AudioReader('/path/to/video.mp4') as audio:  # first audio stream; or strea
     snippet = audio[48000:96000]  # by sample index: same samples as reading sequentially
     during_frame_7 = audio.read_time(reader.frame_times[7], reader.frame_times[8])  # same clock as VideoReader
 ```
-Sample `i` is the i-th decoded sample. Random access is bit-exact for uncompressed and lossless audio (wav, flac), mp3, and aac written by `VideoWriter`. Some lossy decoders synthesize noise, so samples read after a jump can differ from a sequential read: opus by about 1e-4, and aac with perceptual noise substitution (the default of FFmpeg's aac encoder) as much as the noise-like parts of the signal (encode with `-aac_pns 0` to avoid this). Before the first random access, `AudioReader` checks that the time stamps have no gaps or overlaps (instantly for aac in mp4; other files are decoded once, at about 1000x real time). Files with gaps (e.g. dropped audio) or overlaps, and flac or vorbis in ogg files, are read by counting samples instead, with a warning.
+Sample `i` is the i-th decoded sample. Random access is bit-exact for uncompressed and lossless audio (wav, flac), mp3, and aac written by `VideoWriter`. Some lossy decoders synthesize noise, so samples read after a jump can differ from a sequential read: opus by about 1e-4, and aac with perceptual noise substitution (the default of FFmpeg's aac encoder) as much as the noise-like parts of the signal (encode with `-aac_pns 0` to avoid this). Before the first random access, `AudioReader` checks that the time stamps have no gaps or overlaps (instantly for aac, alac and flac in mp4/m4a; other files are decoded once, which takes e.g. about 1 s for 10 minutes of flac). Files with gaps (e.g. dropped audio) or overlaps, and flac or vorbis in ogg files, are read by counting samples instead, with a warning.
 
 ### HDF5 file IO
 

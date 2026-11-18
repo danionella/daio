@@ -689,6 +689,7 @@ class AudioReader(_TagReader):
         self.seekable = True  # False: time stamps are missing or irregular, samples are decoded from the start
         self._ticks = float(self.stream.time_base * self.sample_rate)  # samples per time stamp tick
         self._offset = 0  # sample position = round(pts * ticks) + offset
+        self._frame_size = None  # samples per frame (of the second frame), if determined
         self._grid = None  # coarse time stamps (e.g. 1 ms in mkv): (position, frame size, pts * ticks) of a reference frame
         self._start_time = 0.0
         self._nsamples = None
@@ -739,6 +740,7 @@ class AudioReader(_TagReader):
         if any(pts is None for pts, _ in frames):
             return self._set_unseekable('missing time stamps')
         ref = min(1, len(frames) - 1) # the first frame may be shortened: calibrate on the second one
+        self._frame_size = frames[ref][1] if ref else None
         counted = [sum(n for _, n in frames[:i]) for i in range(len(frames))]
         raw = [pts * self._ticks for pts, _ in frames]
         tb = float(self.stream.time_base)
@@ -761,9 +763,10 @@ class AudioReader(_TagReader):
             return self._set_unseekable('gap or overlap after the first frame')
 
     def _check_time_stamps(self):
-        ''' Check (once, before the first random access) that the time stamps have no gaps, so that positions from
-        time stamps equal sample counts. For codecs with a fixed frame size and a complete container index (e.g. aac in
-        mp4), the index is checked (no file read). Otherwise, the audio is decoded once (about 1000x real time) and each
+        ''' Check (once, before the first random access) that the time stamps have no gaps or overlaps, so that
+        positions from time stamps equal sample counts. If the codec guarantees a fixed frame size (e.g. aac, alac,
+        flac with a fixed block size) and the container index is complete (e.g. mp4), the index is checked: every frame
+        but the last must last exactly one frame size (no file read). Otherwise, the audio is decoded once and each
         frame's position is compared with the number of samples before it. (Packet time stamps alone are not enough:
         mp4 stores a gap as a longer duration of the preceding frame.) '''
         if self._checked or not self.seekable:
@@ -776,8 +779,10 @@ class AudioReader(_TagReader):
             return False
         tolerance = 1.5 * max(self._ticks, 1) # (coarse time stamps are rounded)
         entries = self.stream.index_entries
-        size = self.stream.codec_context.frame_size
-        if size and self.stream.frames and len(entries) == self.stream.frames: # (e.g. mp4: complete sample table)
+        size = _fixed_frame_size(self.stream.codec_context)
+        if (size and size == self._frame_size and self.stream.frames and len(entries) == self.stream.frames):
+            # (complete index, e.g. the sample table of mp4, and a frame size guaranteed by the codec and confirmed by
+            # decoding: a gap or overlap would change the duration of a frame)
             starts = np.array([e.timestamp for e in entries], dtype=np.float64) * self._ticks
             ok = bool(np.all(np.abs(np.diff(starts) - size) <= tolerance)) # (all frames but the last)
         else:
@@ -972,6 +977,22 @@ class AudioReader(_TagReader):
     def __exit__(self, exc_type, exc_value, traceback):
         self.close()
         return False
+
+
+def _fixed_frame_size(codec_context):
+    ''' Samples per frame (all frames but the last), if the codec guarantees a fixed frame size, else None. '''
+    if codec_context.frame_size: # (codecs with a fixed frame size, e.g. aac, mp3, opus)
+        return codec_context.frame_size
+    extradata = codec_context.extradata or b''
+    if codec_context.name == 'alac' and len(extradata) >= 16 and extradata[4:8] == b'alac':
+        return int.from_bytes(extradata[12:16], 'big') or None # (frameLength of the ALAC magic cookie)
+    if codec_context.name == 'flac':
+        if extradata[:4] == b'fLaC':
+            extradata = extradata[8:]
+        if len(extradata) >= 34: # STREAMINFO: minimum and maximum block size (equal: fixed block size)
+            min_size, max_size = int.from_bytes(extradata[0:2], 'big'), int.from_bytes(extradata[2:4], 'big')
+            return min_size if min_size == max_size else None
+    return None
 
 
 def _chain_pending(pending, frames):

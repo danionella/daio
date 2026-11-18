@@ -98,7 +98,7 @@ Map between audio samples and video frames through time (seconds, on the clock o
 ```python
 t = audio.sample_time(i)       # time of sample(s) i
 k = reader.frame_index(t)      # frame(s) with the nearest time; rounding='floor'/'ceil', or None for a fractional index
-i = audio.sample_index(reader.frame_times[k])  # sample(s) nearest to frame k (same rounding options)
+i = audio.sample_index(reader.frame_time(k))   # sample(s) nearest to frame(s) k (same rounding options)
 ```
 Streams can start at different times, so sample 0 does not generally belong to frame 0.
 Sample `i` is the i-th decoded sample. Random access is bit-exact for uncompressed and lossless audio (wav, flac), mp3, and aac written by `VideoWriter`. Some lossy decoders synthesize noise, so samples read after a jump can differ from a sequential read: opus by about 1e-4, and aac with perceptual noise substitution (the default of FFmpeg's aac encoder) as much as the noise-like parts of the signal (encode with `-aac_pns 0` to avoid this). Before the first random access, `AudioReader` checks that the time stamps have no gaps or overlaps (instantly for aac, alac and flac in mp4/m4a; other files are decoded once, which takes e.g. about 1 s for 10 minutes of flac). Files with gaps (e.g. dropped audio) or overlaps, and flac or vorbis in ogg files, are read by counting samples instead, with a warning.

@@ -95,6 +95,7 @@ class VideoReader(_TagReader):
         self._pts_per_frame = 1 / (self.stream.guessed_rate * self.stream.time_base)
         self.wiggle_pts = tolerance * self._pts_per_frame
         self._frame_pts = None  # sorted presentation time stamps of all frames (None: use nominal frame rate)
+        self._times_cache = None  # (frame_pts, frame_times) as returned by these properties (read-only arrays)
         self._keyframe_pts = None  # presentation time stamps of key frames
         self._keyframe_seek_ts = None  # time stamps to seek to for each key frame
         self._frame_pos = None  # file position of each frame's packet (aligned with _frame_pts; -1: unknown)
@@ -239,6 +240,7 @@ class VideoReader(_TagReader):
         ''' Align the frame index (or nominal start time) with the first frame the decoder actually outputs: removes
         frames the decoder never outputs (e.g. when a stream starts mid-GOP) and, for the container index, a constant
         offset between container and decoded time stamps. Also flags duplicate time stamps. '''
+        self._times_cache = None
         first = self._first_frame()
         if first is None or first.pts is None:
             return self._set_unseekable('decoded frames have no time stamps')
@@ -266,6 +268,7 @@ class VideoReader(_TagReader):
             return self._set_unseekable('duplicate time stamps')
 
     def _set_index(self, frame_pts, kf_pts, kf_seek_ts, source, frame_pos=None):
+        self._times_cache = None
         frame_pts = np.asarray(frame_pts, dtype=np.int64)
         order = np.argsort(frame_pts, kind='stable')
         self._frame_pts = frame_pts[order]
@@ -324,16 +327,39 @@ class VideoReader(_TagReader):
 
     @property
     def frame_pts(self):
-        ''' Presentation time stamps of all frames (in units of stream.time_base). Without a frame index (nominal frame
-        rate, or files without time stamps), these are computed from the nominal frame rate. '''
-        if self._frame_pts is not None:
-            return self._frame_pts.copy()
-        return np.array([self._frame_to_pts(i) for i in range(self.nframes)], dtype=np.int64)
+        ''' Presentation time stamps of all frames (in units of stream.time_base; a read-only array). Without a frame
+        index (nominal frame rate, or files without time stamps), these are computed from the nominal frame rate. '''
+        return self._frame_times_cached()[0]
 
     @property
     def frame_times(self):
-        ''' Presentation times of all frames (in seconds). '''
-        return self.frame_pts * float(self.stream.time_base)
+        ''' Presentation times of all frames (in seconds; a read-only array). '''
+        return self._frame_times_cached()[1]
+
+    def _frame_times_cached(self):
+        n = self.nframes # (without a frame index, the frame count can shrink while reading: then recompute)
+        if self._times_cache is None or len(self._times_cache[0]) != n:
+            if self._frame_pts is not None:
+                pts = self._frame_pts.copy()
+            else: # (as _frame_to_pts)
+                step = Fraction(self._pts_per_frame) # (exact, rounded half to even like round(n * step))
+                q, r = np.divmod(np.arange(n, dtype=np.int64) * step.numerator, step.denominator)
+                pts = q + ((2 * r > step.denominator) | ((2 * r == step.denominator) & (q % 2 == 1))) + self._start_time
+            times = pts * float(self.stream.time_base)
+            pts.flags.writeable = times.flags.writeable = False
+            self._times_cache = (pts, times)
+        return self._times_cache
+
+    def frame_time(self, index):
+        ''' Presentation time (in seconds) of a frame index (an integer or an array of integers; negative indices count
+        from the end), on the same clock as AudioReader.sample_time. '''
+        k = np.asarray(index)
+        if k.dtype.kind not in 'iu':
+            raise TypeError(f'frame indices must be integers, not {k.dtype}')
+        n = self.nframes
+        if np.any((k < -n) | (k >= n)):
+            raise IndexError(f'frame index out of range for video with {n} frames')
+        return _scalar_or_array(self.frame_times[k])
 
     def frame_index(self, time, rounding='round'):
         ''' Frame index at a time (in seconds, on the clock of frame_times; a number or an array of times). E.g. the
@@ -350,6 +376,8 @@ class VideoReader(_TagReader):
             int or array of int (float for rounding=None)
         '''
         times = self.frame_times
+        if len(times) == 0:
+            raise ValueError('the video has no frames with known times')
         t = np.asarray(time, dtype=np.float64)
         floor = np.searchsorted(times, t + _TIME_TOLERANCE, side='right') - 1
         if rounding == 'floor':

@@ -510,6 +510,13 @@ def test_audio_video_time_mapping(tmp_path):
         assert reader.frame_index(times[-1] + 0.6 / fps) == len(times) == reader.frame_index(times[-1] + 1, 'ceil')
         assert reader.frame_index(times[0] - 1, 'floor') == -1
         assert isinstance(reader.frame_index(1.0), int)
+        assert reader.frame_time(7) == times[7] and isinstance(reader.frame_time(7), float)
+        assert np.array_equal(reader.frame_time([3, -1]), times[[3, -1]])
+        assert np.array_equal(reader.frame_index(reader.frame_time(k)), k)
+        with pytest.raises(IndexError):
+            reader.frame_time(len(times))
+        with pytest.raises(ValueError): # (frame times are read-only: the reader's own)
+            reader.frame_times[0] = 1.0
         # the samples read during frame k are exactly those whose time falls within frame k
         frame_of_sample = reader.frame_index(audio.sample_time(np.arange(n)), 'floor')
         bounds = audio.sample_index(np.append(times, times[-1] + 1 / fps), 'ceil')

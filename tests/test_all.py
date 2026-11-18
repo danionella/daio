@@ -296,6 +296,54 @@ def test_video_fragmented_mp4_open_does_not_decode_the_file(tmp_path, monkeypatc
             assert len(decoded) < 10, (movflags, len(decoded)) # (a few frames for calibration, not the whole file)
             assert np.array_equal(reader[299], _decode_all(frag)[299])
 
+def _write_tagged_video(filename, options, settings):
+    """ Video with a JSON container tag (e.g. recording settings), a plain container tag and stream tags. """
+    import json
+    with av.open(str(filename), 'w', format='mp4' if str(filename).endswith('.m4v') else None, options=options) as container:
+        container.metadata['settings'] = json.dumps(settings)
+        container.metadata['comment'] = 'plain text'
+        stream = container.add_stream('libx264', rate=25, options={'g': '10'})
+        stream.width, stream.height, stream.pix_fmt = 96, 64, 'yuv420p'
+        stream.metadata['title'] = 'top camera'
+        stream.metadata['handler_name'] = 'cam0'
+        for frame in _ramp_frames(60):
+            for packet in stream.encode(av.VideoFrame.from_ndarray(frame, format='gray')):
+                container.mux(packet)
+        for packet in stream.encode():
+            container.mux(packet)
+
+def test_video_tags(tmp_path):
+    import io, pytest
+    settings = {'camera': 'cam0', 'exposure_us': 5000, 'roi': [0, 0, 96, 64]}
+    files = {
+        'normal.mp4': {'movflags': 'use_metadata_tags'},
+        'normal.m4v': {'movflags': 'use_metadata_tags'},
+        'fragmented.mp4': {'movflags': 'use_metadata_tags+delay_moov+default_base_moof', 'frag_duration': '500000'},
+        'tags.mkv': {}, # (mkv stores custom tag names in upper case)
+    }
+    for name, options in files.items():
+        _write_tagged_video(tmp_path / name, options, settings)
+    data = (tmp_path / 'fragmented.mp4').read_bytes() # recording cut off mid-file
+    (tmp_path / 'cut.mp4').write_bytes(data[:int(len(data) * 0.6)])
+    for name in list(files) + ['cut.mp4']:
+        filename = tmp_path / name
+        for source in [filename, io.BytesIO(filename.read_bytes())]:
+            with warnings.catch_warnings():
+                warnings.simplefilter('ignore') # (the cut-off file warns about damaged data)
+                reader = VideoReader(source)
+            tags = reader.list_tags()
+            assert set(tags) == {'container', 'streams'} and list(tags['streams']) == [0], name
+            assert reader.read_tag('settings') == settings, name # JSON is parsed
+            assert reader.read_tag('settings', parse_json=False).startswith('{"camera"'), name
+            assert reader.read_tag('comment') == 'plain text', name # not JSON: returned as string
+            assert reader.read_tag('missing') is None and reader.read_tag('missing', default=42) == 42, name
+            assert reader.read_tag('handler_name', stream=0) == 'cam0', name
+            # (mp4 stores a stream title as the track name, read back as 'name')
+            assert reader.read_tag('name' if name.endswith(('mp4', 'm4v')) else 'title', stream='cam0') == 'top camera', name
+            with pytest.raises(KeyError):
+                reader.read_tag('title', stream='no such stream')
+            reader.close()
+
 def test_video_slicing_and_iteration(tmp_path):
     filename = tmp_path / 'slicing.mp4'
     with VideoWriter(filename, fps=25, g='12') as writer:

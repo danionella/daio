@@ -1,3 +1,4 @@
+import json
 import os
 import warnings
 
@@ -289,6 +290,51 @@ class VideoReader:
     def frame_times(self):
         ''' Presentation times of all frames (in seconds). '''
         return self.frame_pts * float(self.stream.time_base)
+
+    def list_tags(self):
+        ''' Metadata tags of the file, as exposed by the container format.
+
+        Returns:
+            dict: {'container': {name: value}, 'streams': {stream index: {name: value}}}. Values are strings. Which
+            tags are available depends on the container: e.g. mp4 files keep custom container tags only if written
+            with movflags=use_metadata_tags, mkv returns custom tag names in upper case, and avi drops them.
+        '''
+        return {'container': dict(self.container.metadata),
+                'streams': {s.index: dict(s.metadata) for s in self.container.streams}}
+
+    def read_tag(self, name, default=None, parse_json=True, stream=None):
+        ''' Read one metadata tag. The name is matched exactly, or else ignoring case (mkv stores tag names in upper case).
+
+        Args:
+            name (str): tag name, e.g. 'settings'
+            default: value returned if the tag does not exist. Default is None.
+            parse_json (bool): if the value is valid JSON, return the parsed object (e.g. a settings dict). Note that
+                plain numbers are valid JSON too ('512' -> 512). Default is True.
+            stream (int or str): read a tag of a stream (by index, or by its handler_name tag) instead of the
+                container. Default is None (container tags).
+
+        Example:
+            >>> settings = reader.read_tag('settings')  # dict, if stored as JSON
+            >>> reader.read_tag('handler_name', stream=0)
+        '''
+        tags = self.container.metadata if stream is None else self._stream_by_tag_or_index(stream).metadata
+        value = _get_tag(tags, name)
+        if value is None:
+            return default
+        if parse_json:
+            try:
+                return json.loads(value)
+            except ValueError:
+                pass
+        return value
+
+    def _stream_by_tag_or_index(self, stream):
+        if isinstance(stream, (int, np.integer)):
+            return self.container.streams[int(stream)]
+        for s in self.container.streams:
+            if _get_tag(s.metadata, 'handler_name') == stream:
+                return s
+        raise KeyError(f'no stream with handler_name {stream!r}')
 
     def read(self):
         ''' Read the next frame in the specified format. '''
@@ -602,6 +648,14 @@ class VideoReader:
             stream = container.streams.video[0]
             shape = np.array([stream.frames, stream.codec_context.height, stream.codec_context.width])
         return shape
+
+
+def _get_tag(tags, name):
+    ''' Tag value by name: exact match, else case-insensitive match. None if missing. '''
+    if name in tags:
+        return tags[name]
+    matches = [value for key, value in tags.items() if key.lower() == name.lower()]
+    return matches[0] if matches else None
 
 
 def warn_transcode(msg):
